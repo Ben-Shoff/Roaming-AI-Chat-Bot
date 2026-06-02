@@ -5,8 +5,11 @@ import ctypes
 import re
 import sys
 import queue
+import warnings
 from pathlib import Path
 from typing import Optional
+
+warnings.filterwarnings("ignore", category=UserWarning, module="webrtcvad")
 
 # Pre-load portaudio + jack from the venv before sounddevice does its import-time
 # dlopen, so the shared libraries are in the process's already-loaded set.
