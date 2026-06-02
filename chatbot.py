@@ -44,6 +44,10 @@ VAD_MODE       = 3          # 0–3; 3 = most aggressive background-noise reject
 SILENCE_FRAMES = 40         # ~1.2 s of continuous silence ends an utterance
 MIN_SPEECH_FRM = 8          # discard clips shorter than ~240 ms of speech frames
 
+WAKE_PHRASE          = "hey sparky"
+WAKE_SILENCE_FRAMES  = 20   # ~0.6 s — shorter wait so wake word triggers snappily
+WAKE_MIN_SPEECH_FRM  = 3    # allow short clips ("hey sparky" is ~0.5 s)
+
 # Piper TTS voice (downloaded on first run)
 VOICE_DIR  = Path.home() / ".local" / "share" / "piper-voices"
 VOICE_NAME = "en_US-lessac-medium"
@@ -97,6 +101,102 @@ def speak(text: str, out_dev: Optional[int]) -> None:
         return
     audio, sr = tts_to_array(text)
     sd.play(audio, samplerate=sr, device=out_dev, blocking=True)
+
+
+def play_beep(out_dev: Optional[int]) -> None:
+    """Play a short rising two-tone chime to signal wake-word activation."""
+    sr = 22_050
+    def tone(freq: float, dur: float) -> np.ndarray:
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        wave = 0.35 * np.sin(2 * np.pi * freq * t).astype(np.float32)
+        fade = min(int(sr * 0.01), len(wave) // 4)
+        wave[:fade]  *= np.linspace(0, 1, fade)
+        wave[-fade:] *= np.linspace(1, 0, fade)
+        return wave
+    chime = np.concatenate([tone(880, 0.12), tone(1320, 0.18)])
+    sd.play(chime, samplerate=sr, device=out_dev, blocking=True)
+
+
+def wait_for_wake_word(
+    in_dev: Optional[int],
+    vad: webrtcvad.Vad,
+    model: WhisperModel,
+) -> str:
+    """
+    Block until the wake phrase ('hey sparky') is detected.
+    Uses VAD to capture each utterance, then does a fast Whisper transcription
+    (beam_size=1) and checks whether 'sparky' appears in the result.
+
+    Returns any question text that was spoken inline after the wake phrase
+    (e.g. "hey sparky, what time is it?" → "what time is it?"), or "" if the
+    user paused after the wake phrase and will speak their question separately.
+    """
+    q: queue.Queue[bytes] = queue.Queue()
+
+    def cb(indata, frames, t, status):
+        q.put(bytes(indata))
+
+    frame_buf: list[bytes] = []
+    speech_count  = 0
+    silence_count = 0
+    in_speech     = False
+
+    with sd.RawInputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=FRAME_SAMPLES,
+        dtype="int16",
+        channels=CHANNELS,
+        device=in_dev,
+        callback=cb,
+    ):
+        print(f"\n[Say '{WAKE_PHRASE}' to activate…]", end="", flush=True)
+        while True:
+            frame = q.get()
+            if len(frame) != FRAME_SAMPLES * 2:
+                continue
+
+            is_speech = vad.is_speech(frame, SAMPLE_RATE)
+
+            if is_speech:
+                if not in_speech:
+                    in_speech     = True
+                    frame_buf     = []
+                    speech_count  = 0
+                    silence_count = 0
+                speech_count  += 1
+                silence_count  = 0
+                frame_buf.append(frame)
+            elif in_speech:
+                silence_count += 1
+                frame_buf.append(frame)
+
+                if silence_count >= WAKE_SILENCE_FRAMES:
+                    if speech_count >= WAKE_MIN_SPEECH_FRM:
+                        audio = (
+                            np.frombuffer(b"".join(frame_buf), dtype=np.int16)
+                            .astype(np.float32) / 32768.0
+                        )
+                        segs, _ = model.transcribe(
+                            audio, language="en", beam_size=1,
+                            best_of=1, temperature=0.0,
+                        )
+                        heard = " ".join(s.text for s in segs).lower().strip()
+                        if "sparky" in heard:
+                            # Strip the wake phrase and return any trailing question
+                            after = heard
+                            for kw in ("hey sparky", "hey sparkey",
+                                       "hey sparkie", "sparky"):
+                                if kw in after:
+                                    after = after[after.index(kw) + len(kw):]
+                                    break
+                            after = after.strip(" ,.-:!?")
+                            print(f" ['{heard}' → wake!]", flush=True)
+                            return after
+                        # Not the wake word — keep waiting silently
+                    frame_buf     = []
+                    speech_count  = 0
+                    silence_count = 0
+                    in_speech     = False
 
 
 # ── VAD + recording ───────────────────────────────────────────────────────────
@@ -309,24 +409,42 @@ def main() -> None:
     client = OpenAI(base_url=LLM_BASE_URL, api_key="none")
     history: list[dict] = []
 
-    print("\nReady!  Speak to chat — say 'quit' or press Ctrl-C to exit.\n")
-    speak("Hello! I'm ready. How can I help you?", out_dev)
+    print(f"\nReady!  Say '{WAKE_PHRASE}' to start, Ctrl-C to quit.\n")
+    speak("Ready. Say hey Sparky to wake me up.", out_dev)
 
     while True:
+        # ── Phase 1: wait for wake word ───────────────────────────────────────
         try:
-            audio = record_speech(in_dev, vad)
+            inline_question = wait_for_wake_word(in_dev, vad, whisper)
         except KeyboardInterrupt:
             print("\nGoodbye.")
             speak("Goodbye!", out_dev)
             break
 
-        if audio is None:
-            continue
+        play_beep(out_dev)
 
-        print("[Transcribing…]", end=" ", flush=True)
-        text = transcribe(audio, whisper)
-        if not text:
-            continue
+        # ── Phase 2: record/use the question ─────────────────────────────────
+        if inline_question:
+            # User spoke their question in the same breath as the wake phrase
+            text = inline_question
+            print(f"[Inline question: '{text}']")
+        else:
+            # Wait for a separate question utterance
+            try:
+                print("[Listening for question…]", end="", flush=True)
+                audio = record_speech(in_dev, vad)
+            except KeyboardInterrupt:
+                print("\nGoodbye.")
+                speak("Goodbye!", out_dev)
+                break
+
+            if audio is None:
+                continue
+
+            print("[Transcribing…]", end=" ", flush=True)
+            text = transcribe(audio, whisper)
+            if not text:
+                continue
         print(f"You: {text}")
 
         if text.lower().strip() in {"quit", "exit", "goodbye", "bye", "stop"}:
