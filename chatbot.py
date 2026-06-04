@@ -47,6 +47,7 @@ def _find_llm_url() -> str:
 
 LLM_BASE_URL     = _find_llm_url()
 LLM_MODEL        = "Qwen/Qwen3.6-35B-A3B-FP8"
+WIKIPEDIA_ZIM_PATH = "~/Downloads/wikipedia_en_all_mini_2026-03.zim"
 TOOLS = [
     {
         "type": "function",
@@ -134,6 +135,28 @@ TOOLS = [
                     },
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_wikipedia",
+            "description": (
+                "Look up a topic in the local offline Wikipedia. "
+                "Use this for factual questions about people, places, events, science, "
+                "history, or any encyclopaedic topic — especially when internet search "
+                "is unavailable or you want a reliable, detailed reference."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Article title or topic to search for",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -772,6 +795,65 @@ def _tool_fetch_url(url: str) -> str:
     return text[:4000] + ("… [truncated]" if len(text) > 4000 else "")
 
 
+def _tool_search_wikipedia(query: str) -> str:
+    if not WIKIPEDIA_ZIM_PATH:
+        return "Wikipedia ZIM path not configured. Set WIKIPEDIA_ZIM_PATH in chatbot.py."
+    zim_path = Path(WIKIPEDIA_ZIM_PATH).expanduser()
+    if not zim_path.exists():
+        return f"Wikipedia ZIM file not found: {WIKIPEDIA_ZIM_PATH}"
+    try:
+        import libzim.reader as _zr
+        from libzim.search import Searcher as _Searcher, Query as _Query
+        from bs4 import BeautifulSoup as _BS
+
+        archive = _zr.Archive(str(zim_path))
+
+        # Full-text search first
+        entry_path = None
+        if archive.has_fulltext_index:
+            s = _Searcher(archive).search(_Query().set_query(query))
+            results = list(s.getResults(0, 1))
+            if results:
+                entry_path = results[0]
+
+        # Fall back to direct title lookup
+        if entry_path is None:
+            for candidate in (query, query.replace(" ", "_")):
+                for prefix in ("A/", ""):
+                    try:
+                        archive.get_entry_by_path(f"{prefix}{candidate}")
+                        entry_path = f"{prefix}{candidate}"
+                        break
+                    except KeyError:
+                        pass
+                if entry_path:
+                    break
+
+        if entry_path is None:
+            return f"No Wikipedia article found for '{query}'."
+
+        entry = archive.get_entry_by_path(entry_path)
+        html  = bytes(entry.get_item().content).decode("utf-8", errors="replace")
+
+        soup = _BS(html, "html.parser")
+        for tag in soup(["nav", "footer", "table", "sup", "style", "script",
+                         "figure", ".reflist", ".navbox", ".infobox"]):
+            tag.decompose()
+
+        main = (soup.find("div", class_="mw-parser-output")
+                or soup.find("article")
+                or soup.find("div", id="mw-content-text")
+                or soup.body or soup)
+
+        text = re.sub(r"\s+", " ", main.get_text(separator=" ", strip=True)).strip()
+        title = entry.title or query
+        result = f"Wikipedia — {title}\n\n{text}"
+        return result[:4000] + ("… [truncated]" if len(result) > 4000 else "")
+
+    except Exception as exc:
+        return f"Wikipedia lookup error: {exc}"
+
+
 def _tool_write_file(path: str, content: str, mode: str = "write") -> str:
     from pathlib import Path as _Path
     p = _Path(path)
@@ -959,6 +1041,8 @@ def _execute_tool(name: str, args: dict) -> str:
         return _tool_view_camera(args.get("question", "What do you see?"))
     if name == "write_file":
         return _tool_write_file(args.get("path", "untitled.txt"), args.get("content", ""), args.get("mode", "write"))
+    if name == "search_wikipedia":
+        return _tool_search_wikipedia(args.get("query", ""))
     return f"Unknown tool: {name}"
 
 
