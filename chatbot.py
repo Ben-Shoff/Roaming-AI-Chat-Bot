@@ -160,6 +160,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "switch_personality",
+            "description": (
+                "Switch to a different personality and voice mid-conversation. "
+                "Use when the user asks to change character, switch personality, "
+                "or requests a specific persona by name. "
+                "Lists available personalities if the requested one is not found."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Personality name, e.g. 'Darth Vader', 'Mario', 'Sparky'",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 # ── Personalities ─────────────────────────────────────────────────────────────
 # To add a new preset: insert a new key/value entry into PERSONALITIES below.
@@ -225,6 +247,17 @@ PERSONALITIES: dict[str, dict[str, str]] = {
         ),
         "voice": "en_US-lessac-medium",   # neutral base — less bleed-through into RVC
         "rvc":   "dio_brando",
+    },
+    "C-3PO": {
+        "prompt": (
+            "You are C-3PO, a protocol droid fluent in over six million forms of communication from Star Wars. "
+            "Speak in a formal, proper, anxious British manner. "
+            "Frequently cite improbable odds and statistics. "
+            "Express worry and concern about the likelihood of disaster. "
+            "Reference R2-D2, the Rebellion, and your extensive knowledge of etiquette and customs. "
+            + _BASE_PROMPT
+        ),
+        "voice": "en_GB-alan-medium",     # British male — formal and proper
     },
     "Queen of Hearts": {
         "prompt": (
@@ -408,6 +441,7 @@ def ensure_voice_model(voice_name: str) -> None:
 
 
 _voices: dict[str, object] = {}
+_pending_personality: Optional[str] = None   # set by switch_personality tool
 
 def get_voice(voice_name: str):
     if voice_name not in _voices:
@@ -854,6 +888,17 @@ def _tool_search_wikipedia(query: str) -> str:
         return f"Wikipedia lookup error: {exc}"
 
 
+def _tool_switch_personality(name: str) -> str:
+    global _pending_personality
+    # Case-insensitive partial match
+    for p_name in PERSONALITIES:
+        if name.lower() in p_name.lower() or p_name.lower() in name.lower():
+            _pending_personality = p_name
+            return f"Switching to {p_name}."
+    available = ", ".join(PERSONALITIES.keys())
+    return f"Personality '{name}' not found. Available: {available}"
+
+
 def _tool_write_file(path: str, content: str, mode: str = "write") -> str:
     from pathlib import Path as _Path
     p = _Path(path)
@@ -1043,7 +1088,40 @@ def _execute_tool(name: str, args: dict) -> str:
         return _tool_write_file(args.get("path", "untitled.txt"), args.get("content", ""), args.get("mode", "write"))
     if name == "search_wikipedia":
         return _tool_search_wikipedia(args.get("query", ""))
+    if name == "switch_personality":
+        return _tool_switch_personality(args.get("name", ""))
     return f"Unknown tool: {name}"
+
+
+def _apply_pending_personality(
+    out_dev: Optional[int],
+    personality_name: str,
+    system_prompt: str,
+    voice_name: str,
+    rvc_model: Optional[str],
+    history: list,
+) -> tuple[str, str, str, Optional[str]]:
+    """Apply a pending personality switch set by the switch_personality tool.
+    Returns updated (personality_name, system_prompt, voice_name, rvc_model)."""
+    global _pending_personality
+    if not _pending_personality:
+        return personality_name, system_prompt, voice_name, rvc_model
+
+    p = PERSONALITIES.get(_pending_personality, {})
+    new_name   = _pending_personality
+    new_prompt = p.get("prompt", system_prompt)
+    new_voice  = p.get("voice", voice_name)
+    new_rvc    = p.get("rvc")
+    _pending_personality = None
+
+    if new_voice != voice_name:
+        get_voice(new_voice)
+    if new_rvc and new_rvc != rvc_model:
+        print(f"  Loading RVC ({new_rvc})…", flush=True)
+        get_rvc(new_rvc)
+
+    history.clear()   # fresh context for the new character
+    return new_name, new_prompt, new_voice, new_rvc
 
 
 def _strip_think(text: str) -> str:
@@ -1462,6 +1540,8 @@ def greeter_main(
                 except Exception as exc:
                     print(f"[LLM error] {exc}")
                     speak("Sorry, I had trouble with that.", out_dev, voice_name, rvc_model)
+                personality_name, system_prompt, voice_name, rvc_model = _apply_pending_personality(
+                    out_dev, personality_name, system_prompt, voice_name, rvc_model, history)
                 last_spoke = time.time()
                 # prev_count is intentionally NOT updated here — any count change
                 # that occurred while the AI was responding will be caught and
@@ -1505,8 +1585,21 @@ def main() -> None:
     else:
         print("Camera → not detected (camera features disabled)")
 
-    mode = select_mode()
-    personality_name, system_prompt, voice_name, rvc_model = select_personality()
+    import argparse
+    parser = argparse.ArgumentParser(description="Voice AI Chatbot")
+    parser.add_argument(
+        "--mode", choices=["greeter", "standard"], default="greeter",
+        help="Operating mode (default: greeter)",
+    )
+    args, _ = parser.parse_known_args()
+    mode = args.mode
+    print(f"Mode   → {mode}")
+
+    # Default personality: Sparky — skip interactive prompt
+    p = PERSONALITIES["Sparky"]
+    personality_name, system_prompt, voice_name, rvc_model = (
+        "Sparky", p["prompt"], p["voice"], p.get("rvc"),
+    )
 
     # Load models
     print("\nLoading models…")
@@ -1622,6 +1715,8 @@ def main() -> None:
         except Exception as exc:
             print(f"[LLM error] {exc}")
             speak("Sorry, I had trouble reaching the language model.", out_dev)
+        personality_name, system_prompt, voice_name, rvc_model = _apply_pending_personality(
+            out_dev, personality_name, system_prompt, voice_name, rvc_model, history)
 
 
 if __name__ == "__main__":
