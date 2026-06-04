@@ -1525,14 +1525,6 @@ def greeter_main(
                     prev_count = 0
                     break
 
-                if _wants_personality_change(text):
-                    personality_name, system_prompt, voice_name, rvc_model = select_personality()
-                    history = []
-                    if rvc_model:
-                        print(f"  Preloading RVC ({rvc_model})…", flush=True)
-                        get_rvc(rvc_model)
-                    speak(f"Switching to {personality_name}.", out_dev, voice_name, rvc_model)
-                    continue
 
                 print("[Thinking…]")
                 try:
@@ -1700,14 +1692,6 @@ def main() -> None:
             speak(f"Returning to wake word mode. Say hey Sparky to wake me up.", out_dev, voice_name, rvc_model)
             continue
 
-        if _wants_personality_change(text):
-            personality_name, system_prompt, voice_name, rvc_model = select_personality()
-            history = []
-            if rvc_model:
-                print(f"  Preloading RVC ({rvc_model})…", flush=True)
-                get_rvc(rvc_model)
-            speak(f"Switching to {personality_name}.", out_dev, voice_name, rvc_model)
-            continue
 
         print("[Thinking…]")
         try:
