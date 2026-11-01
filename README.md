@@ -9,3 +9,5 @@ The AI takes a photo of its surroundings. It then interprets the image and from 
 If a conversation is initiated, the AI stops moving entirely for the duration of the conversation. The conversation can then be ended by saying "exit conversation mode" where the AI will return to roaming.
 
 In the summer of 2026, I used Qwen 3.6 as the model.
+
+The drive base robot code for SystemCore can be found at https://github.com/FRC-Team-4143/mainbot-4143-2026/tree/Sparky-roam
