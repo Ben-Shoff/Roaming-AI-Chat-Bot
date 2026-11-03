@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Voice-interactive AI chatbot using a local LLM."""
 
+import collections
+import copy
 import ctypes
 import re
 import sys
@@ -34,7 +36,15 @@ from openai import OpenAI
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 def _find_llm_url() -> str:
-    """Try localhost first; fall back to the fixed remote IP."""
+    """Return the base URL of the OpenAI-compatible LLM server.
+
+    Sparky runs entirely locally on an NVIDIA DGX Spark mounted on the robot:
+    the vLLM server, this chatbot, Whisper, Piper/RVC and the offline
+    Wikipedia all run on that one machine, with no internet connection. So
+    localhost is the normal case and the default — it's the server this
+    program expects to talk to. The fixed 192.168.0.78 address is only for
+    development, when the chatbot is run on another machine against the
+    Spark's server over the LAN."""
     import urllib.request, urllib.error
     for url in ("http://localhost:8000/v1/models",
                 "http://192.168.0.78:8000/v1/models"):
@@ -83,9 +93,11 @@ ROBOT_NT_HOST        = _find_robot_nt_host()
 # asking Sparky to move, scales off these two caps.
 ROAM_MAX_LINEAR_MPS  = 0.5     # hard cap on roam-mode translational speed
 ROAM_MAX_ANGULAR_RPS = 1.0   # hard cap on roam-mode rotation speed (~67.5 deg/s)
-ROAM_SCAN_INTERVAL   = 2.0     # seconds between navigation camera checks while roaming
 ROAM_MAX_CMD_SEC     = 2.0     # hard cap on the duration of any single drive_robot call
 ROAM_CMD_REFRESH_SEC = 0.1     # how often drive_robot republishes the heartbeat seq
+ROAM_NAV_LLM_TIMEOUT = 15.0    # seconds before a hung navigation LLM call is abandoned and retried fresh
+ROAM_NAV_HISTORY_LEN = 15      # recent navigation steps shown back to the explore LLM
+ROAM_NAV_CELL_M      = 1.0     # grid cell size (m) for tracking which areas were visited
 TOOLS = [
     {
         "type": "function",
@@ -98,8 +110,9 @@ TOOLS = [
                 "text, or people, or asks any question requiring visual information. "
                 "There may be more than one camera — use the optional 'camera' "
                 "argument to pick a specific one if the user asks to look in a "
-                "particular direction (e.g. 'look behind you')."
-		"Whenever a task requires vision, always view the camera again to see if something changed. Do not simply go off your previous camera snapshots."
+                "particular direction (e.g. 'look behind you'). "
+                "Whenever a task requires vision, always view the camera again to see if "
+                "something changed. Do not simply go off your previous camera snapshots."
             ),
             "parameters": {
                 "type": "object",
@@ -216,8 +229,8 @@ DRIVE_ROBOT_TOOL = {
             f"forward always run at full speed for {ROAM_MAX_CMD_SEC} "
             "seconds — issue another call to keep moving. rotate_left/rotate_right "
             "turn a fixed number of degrees (see the degrees parameter) instead "
-            "of running for a chosen speed and duration."
-            "use direction stop to not move."
+            "of running for a chosen speed and duration. "
+            "Use direction stop to not move."
         ),
         "parameters": {
             "type": "object",
@@ -237,8 +250,20 @@ DRIVE_ROBOT_TOOL = {
         },
     },
 }
-# Used for the focused per-scan navigation decision in ROAMING state.
-ROAM_NAV_TOOLS = [DRIVE_ROBOT_TOOL]
+# The navigator's copy adds a wait_for_person direction. Plain "stop" used to
+# double as "I see a person", but the navigator also stops for walls and
+# obstacles — and a stop that means "person" starts a conversation (greeting
+# plus a pause in exploring), so the two need to be separate choices. The chat
+# LLM's tool doesn't get it: it's already talking to someone.
+_NAV_DRIVE_ROBOT_TOOL = copy.deepcopy(DRIVE_ROBOT_TOOL)
+_NAV_DRIVE_ROBOT_TOOL["function"]["parameters"]["properties"]["direction"]["enum"].append("wait_for_person")
+_NAV_DRIVE_ROBOT_TOOL["function"]["description"] += (
+    " Use wait_for_person ONLY when you can actually see a person nearby: it "
+    "stops the robot and greets them. To stay still for any other reason "
+    "(an obstacle, a blocked view, being unsure), use stop instead."
+)
+# Used for the focused per-step navigation decision while exploring.
+ROAM_NAV_TOOLS = [_NAV_DRIVE_ROBOT_TOOL]
 # Used during a conversation so a person can ask Sparky to move while chatting.
 ROAM_CHAT_TOOLS = TOOLS + [DRIVE_ROBOT_TOOL]
 
@@ -253,11 +278,19 @@ _EXPLORE_SYSTEM_PROMPT = (
     "But quickly explain your logic for debugging. "
     "Explore the surroundings — vary your path with turns as well "
     "as straight moves rather than only ever moving in a straight line, and "
-    "periodically turn to check what's around you. If you see a person "
-    "hold position nearby so they have the chance to say "
-    "'hey sparky' and start a conversation. Do this by using the drive_robot stop tool"
+    "periodically turn to check what's around you. If you see a person, "
+    "hold position nearby so they have the chance to talk to you — do this "
+    "with direction wait_for_person, which also greets them. Only use "
+    "wait_for_person for an actual person; if you just need to stay still "
+    "(an obstacle, a blocked or unclear view), use stop or turn away instead. "
     "You may be shown more than one camera view at once, each labeled with which camera it's from. Only trust a label that states an actual direction (front/left/right or a degree offset) — a label that says the direction is unknown just means that camera hasn't been mapped to a direction yet, so judge your surroundings from the image content itself rather than assuming which way it's pointed. "
-    "Never run into objects. A single move command moves about one meter."
+    "Never run into objects. A single move command moves about one meter. "
+    "Each request also includes your estimated position, the grid cells you "
+    "have already visited, and your recent moves with what you saw. Use them "
+    "to head toward places you haven't been yet, and avoid repeating the same "
+    "moves or going back over areas you've already explored. The position is "
+    "a rough dead-reckoning estimate that drifts over time, so always trust the "
+    "cameras over it when it comes to obstacles."
 )
 
 # ── Personalities ─────────────────────────────────────────────────────────────
@@ -266,14 +299,17 @@ _BASE_PROMPT = (
     "Give concise, conversational responses suitable for speech. "
     "Never use emojis, asterisks, markdown formatting, bullet points, code blocks, or any special characters. "
     "You have access to tools: view_camera to see through one of your cameras — pass the optional camera argument (e.g. 'front', 'left', 'right') if the user asks you to look in a specific direction. "
-    "You have access to tools search_wikipedia to look through a downloaded version of wikipedia for information."
-    "You have access to the write_file tool which lets to write files onto the local machine"
-    "You have access to the switch_personality tool which lets the user change your personality with voice. Always use this tool when the user mentions something similar to you changing personalities. Never simply change personality without the tool."
-    "You are mounted on a moving swerve drive base. Exploring the surroundings and approaching people is handled entirely by a separate, independent part of the system — not by you — so you never need to think about exploring, patrolling, or looking for people, and you have no tool to control it. "
-    "You are only ever invoked to hold a conversation with someone once they say 'hey sparky'; there is no greeting to perform and you should never speak first or address someone before they've woken you. "
+    "You have access to the search_wikipedia tool to look through a downloaded copy of Wikipedia for information. "
+    "You have access to the write_file tool, which lets you write files onto the local machine. "
+    "You have access to the switch_personality tool, which lets the user change your personality with voice. Always use this tool when the user mentions something similar to you changing personalities. Never simply change personality without the tool. "
+    "You are mounted on a moving swerve drive base. Exploring the surroundings and finding people is handled entirely by a separate, independent part of the system — not by you — so you never need to think about exploring, patrolling, or looking for people. "
+    "You are brought into a conversation either when someone says 'hey sparky', or when that separate part of the system has stopped near a person and already greeted them for you. Don't greet people again or start talking to anyone unprompted; just respond to what they say. "
     "During a conversation you may use the drive_robot tool, but only if the person you're talking to explicitly asks you to move, turn, follow them, or reposition — never use it on your own initiative. "
-    "Always prioritize using a tool when it would be helpful, even if the user does not ask specifically for the tool. For example, for any question requiring information from past your training date, you should look online. This includes anything relating to current events."
-    "Today is July of 2026."
+    "Always prioritize using a tool when it would be helpful, even if the user does not ask specifically for the tool. "
+    "You have no internet access. For questions about recent events or anything after your training data, use search_wikipedia if it might help, and otherwise say you don't have up-to-date information rather than guessing. "
+    # Filled in when the program starts, rather than hard-coded, so it
+    # doesn't go stale.
+    f"Today is {time.strftime('%B %d, %Y')}."
 )
 # Each entry has "prompt" (system prompt) and "voice" (key into VOICE_REGISTRY).
 # To add a new preset: add an entry here; add the voice to VOICE_REGISTRY if needed.
@@ -384,34 +420,50 @@ _STOP_CALIBRATION_TRIGGERS = frozenset({
 })
 
 
+# Whole utterances (after _normalize_speech) that end the conversation. Matched
+# exactly rather than as phrases so "stop" ends it but "don't stop" doesn't.
+_GOODBYE_PHRASES = frozenset({
+    "quit", "exit", "goodbye", "bye", "bye bye", "stop", "see you", "see ya",
+    "goodbye sparky", "bye sparky", "see you sparky", "see you later",
+})
+
+
+def _normalize_speech(text: str) -> str:
+    """Lowercase *text* and turn punctuation into spaces, so a phrase matches
+    however Whisper happened to punctuate it ("Hey, Sparky." -> "hey sparky",
+    "Goodbye!" -> "goodbye"). Apostrophes are kept so "what's" stays one word."""
+    return " ".join(re.sub(r"[^a-z0-9']+", " ", text.lower()).split())
+
+
+def _has_phrase(text: str, phrases) -> bool:
+    """True if any of *phrases* appears in *text* as whole words, ignoring
+    case and punctuation — so "stop" doesn't match "stopwatch"."""
+    padded = f" {_normalize_speech(text)} "
+    return any(f" {p} " in padded for p in phrases)
+
+
 def _wants_respond_off(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _RESPOND_OFF_TRIGGERS)
+    return _has_phrase(text, _RESPOND_OFF_TRIGGERS)
 
 
 def _wants_respond_on(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _RESPOND_ON_TRIGGERS)
+    return _has_phrase(text, _RESPOND_ON_TRIGGERS)
 
 
 def _wants_calibrate_cameras(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _CALIBRATE_CAMERAS_TRIGGERS)
+    return _has_phrase(text, _CALIBRATE_CAMERAS_TRIGGERS)
 
 
 def _wants_stop_calibration(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _STOP_CALIBRATION_TRIGGERS)
+    return _has_phrase(text, _STOP_CALIBRATION_TRIGGERS)
 
 
 def _wants_conv_on(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _CONV_ON_TRIGGERS)
+    return _has_phrase(text, _CONV_ON_TRIGGERS)
 
 
 def _wants_conv_off(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _CONV_OFF_TRIGGERS)
+    return _has_phrase(text, _CONV_OFF_TRIGGERS)
 
 
 def select_personality() -> tuple[str, str, str, Optional[str]]:
@@ -446,8 +498,7 @@ def select_personality() -> tuple[str, str, str, Optional[str]]:
 
 
 def _wants_personality_change(text: str) -> bool:
-    t = text.lower()
-    return any(trigger in t for trigger in _CHANGE_TRIGGERS)
+    return _has_phrase(text, _CHANGE_TRIGGERS)
 
 
 WHISPER_SIZE   = "base"     # tiny | base | small | medium | large-v3
@@ -472,6 +523,9 @@ STOP_WINDOW_SEC      = 1.5  # rolling audio window re-checked for the word "stop
 STOP_CHECK_INTERVAL  = 0.6  # seconds between re-checks while the assistant talks
 
 CONV_LISTEN_TIMEOUT = 30   # seconds of silence before a free-listening conversation turn gives up
+CHAT_HISTORY_MAX_MESSAGES = 40  # oldest chat messages (incl. tool calls/results) are dropped beyond this
+CONV_IDLE_TIMEOUT       = 30.0  # roam mode: end the conversation after this long with no speech and no person on camera
+CONV_PRESENCE_CHECK_SEC = 5.0   # roam mode: how often the cameras are checked for a person during a conversation
 
 # Piper TTS voices (downloaded on first use)
 VOICE_DIR     = Path.home() / ".local" / "share" / "piper-voices"
@@ -828,16 +882,15 @@ def wait_for_wake_word(
                             best_of=1, temperature=0.0,
                         )
                         heard = " ".join(s.text for s in segs).lower().strip()
-                        if any(kw in heard for kw in WAKE_KEYWORDS):
-                            # Strip the wake phrase and return any trailing question
-                            after = heard
-                            for kw in WAKE_KEYWORDS:
-                                if kw in after:
-                                    after = after[after.index(kw) + len(kw):]
-                                    break
-                            after = after.strip(" ,.-:!?")
-                            print(f" ['{heard}' → wake!]", flush=True)
-                            return after
+                        # Match on the punctuation-free form so "Hey, Sparky"
+                        # counts as well as "hey sparky".
+                        padded = f" {_normalize_speech(heard)} "
+                        for kw in WAKE_KEYWORDS:
+                            if f" {kw} " in padded:
+                                # Strip the wake phrase and return any trailing question
+                                after = padded[padded.index(f" {kw} ") + len(kw) + 2:].strip()
+                                print(f" ['{heard}' → wake!]", flush=True)
+                                return after
                         # Not the wake word — keep waiting silently
                     frame_buf     = []
                     speech_count  = 0
@@ -1083,6 +1136,7 @@ def _init_networktables() -> dict:
     inst = ntcore.NetworkTableInstance.getDefault()
     inst.startClient4("Sparky")
     inst.setServer(ROBOT_NT_HOST)
+    _nt_state["inst"]  = inst
     table = inst.getTable("Sparky/Drive")
     _nt_state["vx"]    = table.getDoubleTopic("cmd_vx").publish()
     _nt_state["vy"]    = table.getDoubleTopic("cmd_vy").publish()
@@ -1090,6 +1144,15 @@ def _init_networktables() -> dict:
     _nt_state["seq"]   = table.getIntegerTopic("cmd_seq").publish()
     _nt_state["seq_n"] = 0
     return _nt_state
+
+
+def _robot_connected() -> bool:
+    """True if the NT4 client currently has a live connection to the robot.
+    Starts the client on first call."""
+    try:
+        return _init_networktables()["inst"].isConnected()
+    except Exception:
+        return False
 
 
 # direction -> unit (vx, vy, omega) in the robot-relative frame, before scaling
@@ -1109,7 +1172,107 @@ _DRIVE_DIRECTIONS: dict[str, tuple[float, float, float]] = {
 _TURN_DEGREE_CHOICES = (30, 45, 90)
 
 
-def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
+# ── Navigation memory ──────────────────────────────────────────────────────────
+# Each _roam_navigate_step call is otherwise a fresh, stateless LLM request, so
+# without this the explorer has no idea where it has been and happily repeats
+# the same moves. Rather than resending old camera images (expensive, and slow
+# on every navigation call), it keeps a compact text memory instead:
+#   - _nav_pose: a dead-reckoned (x, y, heading) estimate built from every
+#     completed drive_robot command — open-loop, so it drifts with wheel slip
+#     and battery voltage, but good enough to tell "been here" from "new area".
+#   - _nav_visits: how many times each ROAM_NAV_CELL_M grid cell was entered.
+#   - _nav_history: the last ROAM_NAV_HISTORY_LEN navigation decisions, each
+#     with what the model said it saw and what it did.
+# Origin (0, 0) heading 0 is wherever the robot was when this process started;
+# +x is that starting forward direction, +y is to its left, heading is CCW+.
+# Lives for the whole process, across conversations — the robot is still in
+# the same place after someone finishes talking to it.
+_nav_lock    = threading.Lock()
+_nav_pose    = {"x": 0.0, "y": 0.0, "heading": 0.0}   # metres, metres, radians
+_nav_visits: dict[tuple[int, int], int] = {(0, 0): 1}
+_nav_history: "collections.deque[dict]" = collections.deque(maxlen=ROAM_NAV_HISTORY_LEN)
+
+
+def _nav_cell(x: float, y: float) -> tuple[int, int]:
+    return round(x / ROAM_NAV_CELL_M), round(y / ROAM_NAV_CELL_M)
+
+
+def _nav_record_motion(dx: float, dy: float, dtheta: float) -> None:
+    """Fold one completed robot-relative motion (metres forward, metres left,
+    radians CCW) into the dead-reckoned pose, and count the grid cell it ends
+    in as visited if that's a different cell from where it started."""
+    import math
+    with _nav_lock:
+        h = _nav_pose["heading"]
+        before = _nav_cell(_nav_pose["x"], _nav_pose["y"])
+        _nav_pose["x"] += dx * math.cos(h) - dy * math.sin(h)
+        _nav_pose["y"] += dx * math.sin(h) + dy * math.cos(h)
+        _nav_pose["heading"] = math.atan2(math.sin(h + dtheta), math.cos(h + dtheta))
+        after = _nav_cell(_nav_pose["x"], _nav_pose["y"])
+        if after != before:
+            _nav_visits[after] = _nav_visits.get(after, 0) + 1
+
+
+def _nav_pose_text(pose: dict) -> str:
+    import math
+    return (f"({pose['x']:.1f}, {pose['y']:.1f}) m, "
+            f"heading {math.degrees(pose['heading']):.0f} deg")
+
+
+def _nav_memory_text() -> str:
+    """Render the navigation memory as the text block sent with each
+    navigation request (see _roam_navigate_step)."""
+    import math
+    with _nav_lock:
+        pose    = dict(_nav_pose)
+        visits  = dict(_nav_visits)
+        history = list(_nav_history)
+
+    lines = [
+        "Navigation memory (position is a rough dead-reckoning estimate: origin is "
+        "where you started, +x is your starting forward direction, +y is to its "
+        "left, heading is counter-clockwise from +x).",
+        f"Current estimated position: {_nav_pose_text(pose)}.",
+    ]
+
+    # Which neighbouring cells are unexplored, relative to the current heading,
+    # so the model doesn't have to do the coordinate math itself.
+    cx, cy = _nav_cell(pose["x"], pose["y"])
+    h = pose["heading"]
+    around = []
+    for name, rel in (("ahead", 0.0), ("to your left", 90.0),
+                      ("to your right", -90.0), ("behind you", 180.0)):
+        a = h + math.radians(rel)
+        cell = (cx + round(math.cos(a)), cy + round(math.sin(a)))
+        n = visits.get(cell, 0)
+        around.append(f"{name}: {'unvisited' if n == 0 else f'visited {n}x'}")
+    lines.append("Neighbouring cells — " + ", ".join(around) + ".")
+
+    most = sorted(visits.items(), key=lambda kv: -kv[1])[:40]
+    lines.append(
+        f"Visited {len(visits)} cell(s) of {ROAM_NAV_CELL_M:g} m so far; "
+        "most-visited (x, y)=times: "
+        + ", ".join(f"({x}, {y})={n}" for (x, y), n in most) + "."
+    )
+
+    if history:
+        now = time.time()
+        lines.append("Recent moves, oldest first:")
+        for i, h_ in enumerate(history, 1):
+            lines.append(
+                f"  {i}. {now - h_['t']:.0f}s ago at {_nav_pose_text(h_['pose'])}: "
+                f"you saw/thought: \"{h_['note']}\" -> {h_['action']} -> {h_['result']}"
+            )
+    else:
+        lines.append("No moves yet — you've just started exploring.")
+    return "\n".join(lines)
+
+
+def _tool_drive_robot(
+    direction: str,
+    degrees: Optional[int] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
+) -> str:
     """Publish a bounded swerve-drive command over NetworkTables.
 
     forward/backward/left/right always run at full speed (ROAM_MAX_LINEAR_MPS)
@@ -1132,12 +1295,13 @@ def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
     robot-side watchdog stops the robot if cmd_seq stops advancing, so this
     republish loop — not just the final zero — is what makes the deadman
     safety work if this process dies mid-call.
+
+    If *should_abort* is given, it's checked every refresh and the move is
+    cut short (and the robot stopped) as soon as it returns True — the
+    explore thread uses this so a conversation starting mid-move stops the
+    robot immediately instead of after the rest of the move.
     """
     import math
-
-    global conversation_mode
-    if conversation_mode == True:
-        return
 
     unit = _DRIVE_DIRECTIONS.get(direction)
     if unit is None:
@@ -1147,6 +1311,10 @@ def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
         nt = _init_networktables()
     except Exception as e:
         return f"NetworkTables error: {e}"
+    # Publishing while disconnected silently goes nowhere — don't report a
+    # move (or update the navigation pose) that the robot never made.
+    if not nt["inst"].isConnected():
+        return f"Not connected to the robot ({ROBOT_NT_HOST}), so it did not move."
 
     def _publish(vx_: float, vy_: float, omega_: float) -> None:
         nt["seq_n"] += 1
@@ -1157,8 +1325,6 @@ def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
 
     if direction == "stop":
         _publish(0.0, 0.0, 0.0)
-        conversation_mode = True
-        speak( f"Hello. I'm Sparky. Let's chat.", _out_dev)
         return "Stopped."
 
     ux, uy, uw = unit
@@ -1175,12 +1341,19 @@ def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
         summary      = f"Moved {direction} at full speed for {duration_sec:.1f}s."
 
     elapsed = 0.0
+    aborted = False
     while elapsed < duration_sec:
+        if should_abort is not None and should_abort():
+            aborted = True
+            break
         _publish(vx, vy, omega)
         time.sleep(ROAM_CMD_REFRESH_SEC)
         elapsed += ROAM_CMD_REFRESH_SEC
 
     _publish(0.0, 0.0, 0.0)   # don't keep moving once this call returns
+    _nav_record_motion(vx * elapsed, vy * elapsed, omega * elapsed)
+    if aborted:
+        return f"Interrupted after {elapsed:.1f}s of '{direction}' — stopped."
     return summary
 
 
@@ -1537,6 +1710,12 @@ def _get_camera_capture(idx: int):
     if not cap.isOpened():
         cap.release()
         return None
+    # Keep only the newest frame queued. With handles held open between
+    # captures, a deeper driver buffer hands back frames that were queued
+    # earlier — and since navigation now takes its photo the instant a move
+    # finishes, those would show where the robot was mid-move, not where it
+    # stopped. Best-effort: ignored by backends that don't support it.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     _warm_up_camera(cap)
     _camera_captures[idx] = cap
     return cap
@@ -1952,6 +2131,19 @@ def _stream_and_speak(
     return full_raw, tool_calls, user_stopped.is_set()
 
 
+def _trim_history(history: list[dict], max_messages: int = CHAT_HISTORY_MAX_MESSAGES) -> None:
+    """Drop the oldest messages so a long conversation can't outgrow the
+    model's context window. Always cuts at a user message, so the history
+    never starts with a tool result (or an assistant tool call) whose other
+    half has been dropped — the API rejects those."""
+    if len(history) <= max_messages:
+        return
+    cut = len(history) - max_messages
+    while cut < len(history) and history[cut]["role"] != "user":
+        cut += 1
+    del history[:cut]
+
+
 def llm_reply(
     client: OpenAI,
     history: list[dict],
@@ -1974,6 +2166,7 @@ def llm_reply(
     """
     import json as _json
 
+    _trim_history(history)
     history.append({"role": "user", "content": user_text})
 
     while True:
@@ -2153,23 +2346,25 @@ def roam_main(
     rvc_model: Optional[str],
 ) -> None:
     """
-    Roam Mode: the robot explores continuously and autonomously, and holds a
-    conversation only when someone says "hey sparky" — there is no greeting,
-    no camera-triggered engagement, and no other mode to switch into.
+    Roam Mode: the robot explores continuously and autonomously until a
+    conversation starts — either someone says "hey sparky", or the navigator
+    sees a person, stops, and greets them. The conversation (conversation
+    mode) lasts until "conversation mode off" or goodbye, then exploring
+    resumes.
 
     Exploring and conversing are deliberately run on two independent threads
     so neither one can cause the other to be forgotten:
-      - The explore thread (_explore_loop) drives the robot on its own fixed
-        schedule (ROAM_SCAN_INTERVAL) via _roam_navigate_step, which uses a
+      - The explore thread (_explore_loop) drives the robot in a continuous
+        photo -> decide -> move loop via _roam_navigate_step, which uses a
         minimal, navigation-only prompt (_EXPLORE_SYSTEM_PROMPT) that has
-        nothing to do with the chat personality or conversation state.
-      - The main thread only ever listens for "hey sparky" and, once heard,
-        handles that one exchange. It sets `conversing` for the duration —
-        so the explore thread pauses and can't fight over drive_robot with a
-        person-requested move mid-conversation — then clears it the instant
-        the exchange is done, in a `finally`, so exploring reliably resumes
-        on its own. The chat LLM is never relied on to remember to keep
-        exploring; it has no way to control it at all.
+        nothing to do with the chat personality or conversation state. It
+        does nothing at all while a conversation is going on, and cuts short
+        any move in progress the moment one starts.
+      - The main thread handles the conversation. Its chat LLM can still
+        call drive_robot when the person asks it to move — those moves are
+        never fought over, since the navigator is paused. Exploring resumes
+        on its own once conversation mode is turned off; the chat LLM is
+        never relied on to remember to keep exploring.
 
     Safety note: a human must be at the Driver Station with a hand on
     disable at all times Roam Mode runs — that is the real emergency stop.
@@ -2178,6 +2373,7 @@ def roam_main(
     not a substitute for that human oversight.
     """
     import threading
+    global conversation_mode
 
     print("\n[Roam Mode active…]\n", flush=True)
     _debug_set_status(state="exploring")
@@ -2193,25 +2389,86 @@ def roam_main(
     conversing = threading.Event()
     stop_event = threading.Event()
 
+    # The navigator stays hands-off for the whole conversation — from when it
+    # stops for a person it sees, or someone says "hey sparky", until
+    # "conversation mode off" or goodbye — not just while a reply is being
+    # generated. The chat LLM can still call drive_robot itself if asked.
+    def _talking() -> bool:
+        return conversing.is_set() or conversation_mode
+
+    # Last time the person engaged: spoke, or was seen on camera by the
+    # presence check below. A conversation that goes CONV_IDLE_TIMEOUT
+    # without either ends on its own, so a person walking off without
+    # saying goodbye doesn't leave the robot parked forever.
+    last_engaged = time.time()
+
+    def _conv_idle() -> bool:
+        return time.time() - last_engaged > CONV_IDLE_TIMEOUT
+
     def _explore_loop() -> None:
+        global conversation_mode
+        nonlocal last_engaged
         # Own client so exploring never contends with the main conversation
-        # thread's HTTP connection pool.
-        nav_client = OpenAI(base_url=LLM_BASE_URL, api_key="none")
-        last_nav = 0.0
+        # thread's HTTP connection pool. No automatic retries: the SDK's
+        # default 2 retries would stretch a hung call to 3x
+        # ROAM_NAV_LLM_TIMEOUT, whereas the loop just starts a fresh step
+        # (with a fresh photo) right away anyway.
+        nav_client = OpenAI(base_url=LLM_BASE_URL, api_key="none", max_retries=0)
+        last_presence = 0.0
+        seen: Optional[bool] = None
+        robot_up: Optional[bool] = None
         while not stop_event.wait(0.1):
+            if conversation_mode:
+                # Not navigating — use the cameras to check the person is
+                # still there instead. Skipped mid-exchange: the exchange
+                # itself resets the timer when it finishes.
+                if (not conversing.is_set()
+                        and time.time() - last_presence >= CONV_PRESENCE_CHECK_SEC):
+                    now_seen = _person_visible(nav_client)
+                    if now_seen and conversation_mode:
+                        last_engaged = time.time()
+                    if now_seen != seen:
+                        print(f"[Presence: person {'visible' if now_seen else 'not visible'}]", flush=True)
+                        seen = now_seen
+                    last_presence = time.time()
+                continue
+            seen = None
             if conversing.is_set():
                 continue
-            if time.time() - last_nav >= ROAM_SCAN_INTERVAL:
-                _roam_navigate_step(nav_client)
-                last_nav = time.time()
+            # No point asking the LLM for moves the robot can't receive.
+            if not _robot_connected():
+                if robot_up is not False:
+                    print(f"[Explore: waiting for robot connection ({ROBOT_NT_HOST})…]", flush=True)
+                    _debug_set_status(robot="disconnected")
+                robot_up = False
+                stop_event.wait(1.0)
+                continue
+            if robot_up is not True:
+                print("[Explore: robot connected]", flush=True)
+                _debug_set_status(robot="connected")
+            robot_up = True
+            # Back-to-back: _roam_navigate_step only returns once its drive
+            # command has finished, so the next photo is always taken after
+            # the previous move is done — no fixed scan interval.
+            if _roam_navigate_step(nav_client, _talking) and not _talking():
+                # Navigator spotted someone and stopped — start the
+                # conversation so the main thread listens without
+                # needing the wake word. Greet *before* switching modes
+                # so the main thread isn't already free-listening and
+                # doesn't transcribe the greeting as if a person said it.
+                speak(f"Hello. I'm {personality_name}. Let's chat.",
+                      out_dev, voice_name, rvc_model)
+                last_engaged = time.time()
+                conversation_mode = True
+                print("[Conversation mode ON — stopped for a person]", flush=True)
+                _debug_set_status(state="talking")
 
     explorer = threading.Thread(target=_explore_loop, daemon=True)
     explorer.start()
 
     history: list[dict] = []
     responding        = True    # set False by "stop responding" until "continue responding"
-    global conversation_mode
-    conversation_mode = False   # set True by "start conversation mode"
+    conversation_mode = False   # True from wake word / navigator stop until "conversation mode off"
     oldconversation_mode = False
 
     try:
@@ -2220,13 +2477,35 @@ def roam_main(
             # Conversation mode: listen freely, no wake word required.
             # Wake-word mode: always listening for "hey sparky".
             if conversation_mode:
-                audio = record_speech(in_dev, vad, timeout_sec=CONV_LISTEN_TIMEOUT)
+                if _conv_idle():
+                    # Nobody has spoken or been seen for CONV_IDLE_TIMEOUT —
+                    # they've left. End the conversation and resume exploring.
+                    print(f"[Conversation timed out after {CONV_IDLE_TIMEOUT:.0f}s "
+                          "with no speech or person on camera]", flush=True)
+                    conversation_mode = False
+                    # "stop responding" was for that conversation — don't
+                    # leave the next person talking to a muted robot.
+                    responding = True
+                    history.clear()
+                    _debug_set_status(state="exploring")
+                    speak("I'll go back to exploring. Say hey Sparky if you want to talk.",
+                          out_dev, voice_name, rvc_model)
+                    continue
+                audio = record_speech(in_dev, vad, timeout_sec=CONV_LISTEN_TIMEOUT,
+                                      abort_check=_conv_idle)
                 text = transcribe(audio, whisper) if audio is not None else ""
             else:
                 inline = wait_for_wake_word(in_dev, vad, whisper, timeout_sec = 1)
                 if inline is None:
                     text = ""   # wait_for_wake_word has no timeout/abort here, so this shouldn't happen
                 else:
+                    # Someone said "hey sparky" — the conversation (and the
+                    # navigator's pause) lasts until "conversation mode off"
+                    # or goodbye, not just this one exchange.
+                    _tool_drive_robot("stop")
+                    last_engaged = time.time()
+                    conversation_mode = True
+                    print("[Conversation mode ON — woken by wake word]", flush=True)
                     play_beep(out_dev)
                     if inline:
                         text = inline
@@ -2239,7 +2518,7 @@ def roam_main(
 
             if not text:
                 continue
-
+            last_engaged = time.time()
 
             # A person is actively engaging — pause exploring for the
             # duration of this exchange and stop any in-progress movement.
@@ -2265,9 +2544,6 @@ def roam_main(
                         speak("I'm listening again.", out_dev, voice_name, rvc_model)
                     continue
 
-                if not responding:
-                    continue
-
                 # ── Camera calibration ────────────────────────────────────────
                 if _wants_calibrate_cameras(text):
                     print("[Camera calibration starting]", flush=True)
@@ -2276,27 +2552,39 @@ def roam_main(
                     continue
 
                 # ── Conversation mode toggle ─────────────────────────────────
-                if _wants_conv_on(text) and not conversation_mode:
+                # Waking already turns conversation mode on, so these don't
+                # check its current state — the phrase is still acknowledged
+                # rather than falling through to the LLM.
+                if _wants_conv_on(text):
                     conversation_mode = True
                     print("[Conversation mode ON — speak freely, say 'stop conversation mode' to return to wake word]\n", flush=True)
                     speak("Conversation mode on. I'm listening.", out_dev, voice_name, rvc_model)
                     continue
 
-                if _wants_conv_off(text) and conversation_mode:
+                if _wants_conv_off(text):
                     conversation_mode = False
+                    responding = True
                     print(f"[Wake word mode — say '{WAKE_PHRASE}' to activate]\n", flush=True)
-                    speak("Returning to wake word mode. Say hey Sparky to wake me up.", out_dev, voice_name, rvc_model)
+                    speak("Okay, I'll go back to exploring. Say hey Sparky to talk to me again.",
+                          out_dev, voice_name, rvc_model)
                     continue
 
                 # Explicit farewell — end the session so the next "hey sparky"
                 # (from this person or someone new) starts a fresh context
                 # instead of dragging along a stale prior conversation.
-                if text.lower().strip() in {"quit", "exit", "goodbye", "bye", "stop", "see you"}:
+                if _normalize_speech(text) in _GOODBYE_PHRASES:
                     _say_in_character(client, system_prompt,
                         "The person just said goodbye to you. Say a warm in-character farewell (1 sentence).",
                         out_dev, voice_name, rvc_model)
                     conversation_mode = False
+                    responding = True
                     history.clear()
+                    continue
+
+                # Checked here, after the commands above, so a paused
+                # conversation can still be ended ("conversation mode off",
+                # goodbye) — it only suppresses actual replies.
+                if not responding:
                     continue
 
                 print("[Thinking…]")
@@ -2309,10 +2597,14 @@ def roam_main(
                 personality_name, system_prompt, voice_name, rvc_model = _apply_pending_personality(
                     out_dev, personality_name, system_prompt, voice_name, rvc_model, history)
             finally:
-                # Whatever just happened, exploring resumes immediately — it
-                # is never left waiting on the chat LLM to remember it.
+                # Whatever just happened, exploring resumes as soon as the
+                # conversation is over (conversation mode off or goodbye) —
+                # it is never left waiting on the chat LLM to remember it.
+                # The idle timer counts from when Sparky finishes replying,
+                # not from when the person started speaking.
+                last_engaged = time.time()
                 conversing.clear()
-                _debug_set_status(state="exploring")
+                _debug_set_status(state="talking" if conversation_mode else "exploring")
 
     except KeyboardInterrupt:
         print("\n[Roam Mode stopped]")
@@ -2325,12 +2617,54 @@ def roam_main(
             pass
 
 
-def _roam_navigate_step(client: OpenAI) -> None:
+def _person_visible(client: OpenAI) -> bool:
+    """Ask the vision LLM whether a person is visible in any camera right
+    now. Used during a roam-mode conversation to keep it alive while the
+    person is still standing there, even if they've gone quiet (see
+    CONV_IDLE_TIMEOUT). Any failure — no cameras, LLM error or timeout —
+    counts as "not seen", so a broken camera can only end a conversation
+    early, never keep the robot parked forever."""
+    frames = _capture_camera_frames(warmup_frames=2)
+    if not frames:
+        return False
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": [
+                *({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                  for _, _, b64 in frames),
+                {"type": "text", "text": (
+                    "Is at least one person visible in any of these camera images? "
+                    "Answer with only yes or no."
+                )},
+            ]}],
+            max_tokens=5,
+            timeout=4.0,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        answer = _strip_think(resp.choices[0].message.content or "").strip().lower()
+        return answer.startswith("yes")
+    except Exception as exc:
+        print(f"[_person_visible error] {exc}", file=sys.stderr)
+        return False
+
+
+def _roam_navigate_step(client: OpenAI, paused: Callable[[], bool]) -> bool:
     """Ask the LLM to choose one bounded drive_robot movement based on the
-    current camera views, then execute it. Called on its own fixed schedule
-    (ROAM_SCAN_INTERVAL) by the explore thread in roam_main, entirely
-    independent of whether a conversation is happening — see that function
-    for why exploring and conversing are split across two threads.
+    current camera views, then execute it. Called back-to-back by the
+    explore thread in roam_main — it doesn't return until the move has
+    finished, so each call's photo is taken after the previous move — see that
+    function for why exploring and conversing are split across two threads.
+
+    *paused* reports whether a conversation is going on. The explore thread
+    only calls this while it's False, but a conversation can start during
+    the (multi-second) LLM call or the move itself, so it's re-checked right
+    before driving and on every refresh during the move — the navigator
+    never moves the robot while someone is talking to it.
+
+    Returns True if the navigator chose "wait_for_person" (it sees a person
+    and is holding position for them), so the caller can start a
+    conversation. A plain "stop" returns False and exploring carries on.
 
     Captures a frame from every connected camera (up to CAMERA_MAX_COUNT)
     and sends all of them in one call so the model can reason about its
@@ -2344,18 +2678,24 @@ def _roam_navigate_step(client: OpenAI) -> None:
     Uses _EXPLORE_SYSTEM_PROMPT — a minimal, navigation-only prompt, not the
     chatbot's personality prompt — and only exposes ROAM_NAV_TOOLS (just
     drive_robot), so this cheap, frequent decision is never diluted by
-    conversational context. If the model doesn't return a tool call (e.g.
+    conversational context. Each request also carries the navigation memory
+    (see _nav_memory_text) — estimated position, visited grid cells, and the
+    last few decisions — so the model can steer toward unexplored areas
+    instead of repeating itself. If the model doesn't return a tool call (e.g.
     the backend doesn't support forcing one), the robot simply stays put
     for this cycle, which is the safe failure mode.
     """
     frames = _capture_camera_frames(warmup_frames=2)
     if not frames:
-        return
+        return False
     image_content = [
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
         for _, _, b64 in frames
     ]
     labels = ", ".join(_camera_label(idx) for idx, _, _ in frames)
+    memory = _nav_memory_text()
+    with _nav_lock:
+        pose_before = dict(_nav_pose)
     try:
         resp = client.chat.completions.create(
             model=LLM_MODEL,
@@ -2364,6 +2704,7 @@ def _roam_navigate_step(client: OpenAI) -> None:
                 {"role": "user", "content": [
                     *image_content,
                     {"type": "text", "text": (
+                        f"{memory}\n\n"
                         f"These are your current camera views, in this order: {labels}. "
                         "Make ONE drive_robot call."
                     )},
@@ -2372,12 +2713,14 @@ def _roam_navigate_step(client: OpenAI) -> None:
             tools=ROAM_NAV_TOOLS,
             tool_choice="auto",
             max_tokens=1000,
-            timeout=4.0,
+            timeout=ROAM_NAV_LLM_TIMEOUT,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         msg = resp.choices[0].message
         print(msg.content)
+        note = re.sub(r"\s+", " ", _strip_think(msg.content or "")).strip()[:200] or "(no comment)"
         import json as _json
+        acted = False
         for tc in (msg.tool_calls or []):
             if tc.function.name != "drive_robot":
                 continue
@@ -2385,10 +2728,36 @@ def _roam_navigate_step(client: OpenAI) -> None:
                 args = _json.loads(tc.function.arguments)
             except Exception:
                 args = {}
+            if paused():
+                # A conversation started while the LLM was deciding — drop
+                # the stale decision; the person owns the robot now.
+                print("[Explore: conversation started, discarding move]", flush=True)
+                return False
             print(f"[Explore: drive_robot({args})]", flush=True)
-            _tool_drive_robot(args.get("direction", "stop"), args.get("degrees"))
+            direction = args.get("direction", "stop")
+            saw_person = direction == "wait_for_person"
+            result = _tool_drive_robot("stop" if saw_person else direction,
+                                       args.get("degrees"), should_abort=paused)
+            acted = True
+            action = direction + (f" {args['degrees']} deg" if args.get("degrees") and "rotate" in direction else "")
+            with _nav_lock:
+                _nav_history.append({
+                    "t": time.time(), "pose": pose_before, "note": note,
+                    "action": action, "result": result,
+                })
+            # Only an explicit "a person is here" starts a conversation —
+            # a plain stop (obstacle, unclear view) just stays put this step.
+            if saw_person:
+                return True
+        if not acted:
+            with _nav_lock:
+                _nav_history.append({
+                    "t": time.time(), "pose": pose_before, "note": note,
+                    "action": "no drive_robot call", "result": "stayed put",
+                })
     except Exception as exc:
         print(f"[_roam_navigate_step error] {exc}", file=sys.stderr)
+    return False
 
 
 # ── Debug Dashboard ────────────────────────────────────────────────────────────
@@ -2703,7 +3072,7 @@ def main() -> None:
 
         print(f"You: {text}")
 
-        if text.lower().strip() in {"quit", "exit", "goodbye", "bye", "stop"}:
+        if _normalize_speech(text) in _GOODBYE_PHRASES:
             speak("Goodbye!", out_dev, voice_name, rvc_model)
             conversation_mode = False
             break

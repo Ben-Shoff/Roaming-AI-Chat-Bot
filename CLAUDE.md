@@ -23,7 +23,7 @@ Single-file voice pipeline (`chatbot.py`):
 Mic (Brio 101 USB webcam)
   └─ VAD (webrtcvad, mode 3) — 30 ms frames, 1.2 s silence threshold
        └─ STT (faster-whisper, base model, CPU int8)
-            └─ LLM (OpenAI-compatible API → vLLM at 192.168.0.78:8000)
+            └─ LLM (OpenAI-compatible API → vLLM on localhost:8000, same DGX Spark)
                  └─ TTS (piper-tts, en_US-lessac-medium voice)
                       └─ Speaker (HDA NVidia HDMI output)
 ```
@@ -37,9 +37,10 @@ Mic (Brio 101 USB webcam)
 
 ## Hardware
 
+- **Compute:** everything runs locally on an NVIDIA DGX Spark mounted on the robot, with no internet connection — the vLLM server, the chatbot, Whisper, Piper/RVC, and the offline Wikipedia ZIM.
 - **Input:** Logitech Brio 101 webcam (USB Audio, card 2)
 - **Output:** HDA NVidia HDMI, device 3 (monitor "27E2UA")
-- **LLM:** `Qwen/Qwen3.6-35B-A3B-FP8` served via vLLM at `http://192.168.0.78:8000/v1/`
+- **LLM:** `Qwen/Qwen3.6-35B-A3B-FP8` served via vLLM on the same DGX Spark at `http://localhost:8000/v1/`. `_find_llm_url()` tries localhost first; `http://192.168.0.78:8000/v1/` is only a development fallback for running the chatbot on another machine against the Spark's server over the LAN.
 
 ## System dependencies
 

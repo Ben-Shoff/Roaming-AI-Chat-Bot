@@ -1,0 +1,3 @@
+# Everything here runs on the robot's Linux DGX Spark, so keep LF line
+# endings even when checked out on Windows (CRLF breaks bash scripts).
+* text=auto eol=lf
