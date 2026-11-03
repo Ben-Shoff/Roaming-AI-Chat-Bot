@@ -6,3 +6,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Local run/install logs
+*.log
+log*.txt
+videolog.txt

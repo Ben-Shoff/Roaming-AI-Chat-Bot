@@ -81,44 +81,12 @@ ROBOT_NT_HOST        = _find_robot_nt_host()
 # original 1.0 m/s / 1.57 rad/s) now that driving around has been tested
 # successfully — every drive_robot call, whether from exploring or a person
 # asking Sparky to move, scales off these two caps.
-ROAM_MAX_LINEAR_MPS  = 0.75     # hard cap on roam-mode translational speed
-ROAM_MAX_ANGULAR_RPS = 1.1775   # hard cap on roam-mode rotation speed (~67.5 deg/s)
-ROAM_SCAN_INTERVAL   = 1.5     # seconds between navigation camera checks while roaming
+ROAM_MAX_LINEAR_MPS  = 0.5     # hard cap on roam-mode translational speed
+ROAM_MAX_ANGULAR_RPS = 1.0   # hard cap on roam-mode rotation speed (~67.5 deg/s)
+ROAM_SCAN_INTERVAL   = 2.0     # seconds between navigation camera checks while roaming
 ROAM_MAX_CMD_SEC     = 2.0     # hard cap on the duration of any single drive_robot call
 ROAM_CMD_REFRESH_SEC = 0.1     # how often drive_robot republishes the heartbeat seq
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web for current information, news, or facts that may "
-                "be outside your training data. Returns titles, URLs, and snippets. "
-                "Use this whenever the user asks about recent events or live data."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": "Fetch and read the main text content of a web page.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Full URL to retrieve"},
-                },
-                "required": ["url"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -244,25 +212,24 @@ DRIVE_ROBOT_TOOL = {
         "name": "drive_robot",
         "description": (
             "Drive the swerve base, then automatically stop. Use this to "
-            "explore your surroundings, approach a person you want to talk "
-            "to, or reposition during a conversation. "
-            f"forward/backward/left/right always run at full speed for {ROAM_MAX_CMD_SEC} "
+            "explore your surroundings. "
+            f"forward always run at full speed for {ROAM_MAX_CMD_SEC} "
             "seconds — issue another call to keep moving. rotate_left/rotate_right "
             "turn a fixed number of degrees (see the degrees parameter) instead "
             "of running for a chosen speed and duration."
+            "use direction stop to not move."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "direction": {
                     "type": "string",
-                    "enum": ["forward", "backward", "left", "right",
-                             "rotate_left", "rotate_right", "stop"],
+                    "enum": ["forward", "rotate_left", "rotate_right", "stop"],
                     "description": "Direction to move, relative to the robot's current facing.",
                 },
                 "degrees": {
                     "type": "integer",
-                    "enum": [45, 90],
+                    "enum": [30, 45, 90],
                     "description": "Only used with rotate_left/rotate_right: how far to turn.",
                 },
             },
@@ -282,17 +249,15 @@ ROAM_CHAT_TOOLS = TOOLS + [DRIVE_ROBOT_TOOL]
 # never has to "remember" to keep exploring: it isn't involved at all.
 _EXPLORE_SYSTEM_PROMPT = (
     "You are the autonomous navigation module for a mobile robot on a swerve "
-    "drive base. This is not a conversation: nothing you say is ever shown or "
-    "spoken to anyone, and your only useful output is a single drive_robot "
-    "tool call. Explore the surroundings — vary your path with turns as well "
+    "drive base. Your only useful output is a single drive_robot tool call. "
+    "But quickly explain your logic for debugging. "
+    "Explore the surroundings — vary your path with turns as well "
     "as straight moves rather than only ever moving in a straight line, and "
-    "periodically turn to check what's around you. If you see a person, move "
-    "cautiously toward them but never closer than a safe, comfortable talking "
-    "distance, then hold position nearby so they have the chance to say "
-    "'hey sparky' and start a conversation. Never crowd or approach a person "
-    "more closely than that. "
+    "periodically turn to check what's around you. If you see a person "
+    "hold position nearby so they have the chance to say "
+    "'hey sparky' and start a conversation. Do this by using the drive_robot stop tool"
     "You may be shown more than one camera view at once, each labeled with which camera it's from. Only trust a label that states an actual direction (front/left/right or a degree offset) — a label that says the direction is unknown just means that camera hasn't been mapped to a direction yet, so judge your surroundings from the image content itself rather than assuming which way it's pointed. "
-    "NEVER run into objects. If it looks like you will run into an object by moving in a certain direction, NEVER move in that direction until the path is clear. Favor directal movement over rotating when all three cameras are functional. If a camera shows nothing in front of it that will be hit by moving, assume that moving in the direction of that camera is safe."
+    "Never run into objects. A single move command moves about one meter."
 )
 
 # ── Personalities ─────────────────────────────────────────────────────────────
@@ -300,9 +265,8 @@ _EXPLORE_SYSTEM_PROMPT = (
 _BASE_PROMPT = (
     "Give concise, conversational responses suitable for speech. "
     "Never use emojis, asterisks, markdown formatting, bullet points, code blocks, or any special characters. "
-    "You have access to tools: web_search and fetch_url to look things up online, "
-    "and view_camera to see through one of your cameras — pass the optional camera argument (e.g. 'front', 'left', 'right') if the user asks you to look in a specific direction. "
-    "You have access to tools search_wikipedia to look through a downloaded version of wikipedia for information. Use this when offline over web_search or fetch_url"
+    "You have access to tools: view_camera to see through one of your cameras — pass the optional camera argument (e.g. 'front', 'left', 'right') if the user asks you to look in a specific direction. "
+    "You have access to tools search_wikipedia to look through a downloaded version of wikipedia for information."
     "You have access to the write_file tool which lets to write files onto the local machine"
     "You have access to the switch_personality tool which lets the user change your personality with voice. Always use this tool when the user mentions something similar to you changing personalities. Never simply change personality without the tool."
     "You are mounted on a moving swerve drive base. Exploring the surroundings and approaching people is handled entirely by a separate, independent part of the system — not by you — so you never need to think about exploring, patrolling, or looking for people, and you have no tool to control it. "
@@ -581,6 +545,7 @@ def ensure_voice_model(voice_name: str) -> None:
             urllib.request.urlretrieve(url, dest)
     print(f"  Voice '{voice_name}' ready.")
 
+conversation_mode = False
 
 _voices: dict[str, object] = {}
 _pending_personality: Optional[str] = None   # set by switch_personality tool
@@ -588,6 +553,7 @@ _pending_personality: Optional[str] = None   # set by switch_personality tool
 # Set once at startup (see main()) so the interrupt listener can use the same
 # input device, VAD, and Whisper model as the rest of the pipeline.
 _in_dev:  Optional[int]            = None
+_out_dev:  Optional[int]            = None
 _vad:     Optional[webrtcvad.Vad]  = None
 _whisper: Optional[WhisperModel]   = None
 
@@ -1132,15 +1098,15 @@ def _init_networktables() -> dict:
 _DRIVE_DIRECTIONS: dict[str, tuple[float, float, float]] = {
     "forward":      (1.0, 0.0, 0.0),
     "backward":     (-1.0, 0.0, 0.0),
-    "left":         (0.0, 1.0, 0.0),
-    "right":        (0.0, -1.0, 0.0),
+    "strafe_left":         (0.0, 1.0, 0.0),
+    "strafe_right":        (0.0, -1.0, 0.0),
     "rotate_left":  (0.0, 0.0, 1.0),
     "rotate_right": (0.0, 0.0, -1.0),
     "stop":         (0.0, 0.0, 0.0),
 }
 
 
-_TURN_DEGREE_CHOICES = (45, 90)
+_TURN_DEGREE_CHOICES = (30, 45, 90)
 
 
 def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
@@ -1169,6 +1135,10 @@ def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
     """
     import math
 
+    global conversation_mode
+    if conversation_mode == True:
+        return
+
     unit = _DRIVE_DIRECTIONS.get(direction)
     if unit is None:
         return f"Unknown direction '{direction}'. Use one of: {', '.join(_DRIVE_DIRECTIONS)}."
@@ -1187,6 +1157,8 @@ def _tool_drive_robot(direction: str, degrees: Optional[int] = None) -> str:
 
     if direction == "stop":
         _publish(0.0, 0.0, 0.0)
+        conversation_mode = True
+        speak( f"Hello. I'm Sparky. Let's chat.", _out_dev)
         return "Stopped."
 
     ux, uy, uw = unit
@@ -2238,7 +2210,9 @@ def roam_main(
 
     history: list[dict] = []
     responding        = True    # set False by "stop responding" until "continue responding"
+    global conversation_mode
     conversation_mode = False   # set True by "start conversation mode"
+    oldconversation_mode = False
 
     try:
         while True:
@@ -2249,7 +2223,7 @@ def roam_main(
                 audio = record_speech(in_dev, vad, timeout_sec=CONV_LISTEN_TIMEOUT)
                 text = transcribe(audio, whisper) if audio is not None else ""
             else:
-                inline = wait_for_wake_word(in_dev, vad, whisper)
+                inline = wait_for_wake_word(in_dev, vad, whisper, timeout_sec = 1)
                 if inline is None:
                     text = ""   # wait_for_wake_word has no timeout/abort here, so this shouldn't happen
                 else:
@@ -2261,8 +2235,11 @@ def roam_main(
                         audio = record_speech(in_dev, vad, timeout_sec=CONV_LISTEN_TIMEOUT)
                         text = transcribe(audio, whisper) if audio is not None else ""
 
+            oldconversation_mode = conversation_mode
+
             if not text:
                 continue
+
 
             # A person is actively engaging — pause exploring for the
             # duration of this exchange and stop any in-progress movement.
@@ -2394,11 +2371,12 @@ def _roam_navigate_step(client: OpenAI) -> None:
             ],
             tools=ROAM_NAV_TOOLS,
             tool_choice="auto",
-            max_tokens=100,
-            timeout=10.0,
+            max_tokens=1000,
+            timeout=4.0,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         msg = resp.choices[0].message
+        print(msg.content)
         import json as _json
         for tc in (msg.tool_calls or []):
             if tc.function.name != "drive_robot":
@@ -2657,8 +2635,8 @@ def main() -> None:
     client = OpenAI(base_url=LLM_BASE_URL, api_key="none")
 
     # Make these available to the background "stop" interrupt listener.
-    global _in_dev, _vad, _whisper
-    _in_dev, _vad, _whisper = in_dev, vad, whisper
+    global _in_dev, _vad, _whisper, _out_dev
+    _in_dev, _vad, _whisper, _out_dev = in_dev, vad, whisper, out_dev
 
     if mode == "roam":
         roam_main(client, whisper, vad, in_dev, out_dev,
@@ -2727,6 +2705,7 @@ def main() -> None:
 
         if text.lower().strip() in {"quit", "exit", "goodbye", "bye", "stop"}:
             speak("Goodbye!", out_dev, voice_name, rvc_model)
+            conversation_mode = False
             break
 
         if _wants_conv_on(text) and not conversation_mode:

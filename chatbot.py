@@ -9,7 +9,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 warnings.filterwarnings("ignore", category=UserWarning, module="webrtcvad")
 
@@ -43,7 +43,7 @@ def _find_llm_url() -> str:
             return url[: -len("models")]   # strip /models, keep trailing /
         except Exception:
             pass
-    return "http://192.168.0.78:8000/v1/"
+    return "http://localhost:8000/v1/models"
 
 LLM_BASE_URL     = _find_llm_url()
 LLM_MODEL        = "Qwen/Qwen3.6-35B-A3B-FP8"
@@ -190,6 +190,10 @@ _BASE_PROMPT = (
     "Never use emojis, asterisks, markdown formatting, bullet points, code blocks, or any special characters. "
     "You have access to tools: web_search and fetch_url to look things up online, "
     "and view_camera to see through the webcam. "
+    "You have access to tools search_wikipedia to look through a downloaded version of wikipedia for information. Use this when offline over web_search or fetch_url"
+    "You have access to the write_file tool which lets to write files onto the local machine"
+    "You have access to the switch_personality tool which lets the user change your personality with voice. Always use this tool when the user mentions something similar to you changing personalities. Never simply change personality without the tool."
+    "Always prioritize using a tool when it would be helpful, even if the user does not ask specifically for the tool. For example, for any question requiring information from past your training date, you should look online. This includes anything relating to current events." 
     "Today is June of 2026."
 )
 # Each entry has "prompt" (system prompt) and "voice" (key into VOICE_REGISTRY).
@@ -284,6 +288,23 @@ _CONV_OFF_TRIGGERS = frozenset({
     "wake word mode",
 })
 
+_RESPOND_OFF_TRIGGERS = frozenset({
+    "stop responding", "stop listening",
+})
+_RESPOND_ON_TRIGGERS = frozenset({
+    "continue responding", "continue listening", "resume responding", "resume listening",
+})
+
+
+def _wants_respond_off(text: str) -> bool:
+    t = text.lower()
+    return any(trigger in t for trigger in _RESPOND_OFF_TRIGGERS)
+
+
+def _wants_respond_on(text: str) -> bool:
+    t = text.lower()
+    return any(trigger in t for trigger in _RESPOND_ON_TRIGGERS)
+
 
 def _wants_conv_on(text: str) -> bool:
     t = text.lower()
@@ -362,6 +383,9 @@ MIN_SPEECH_FRM = 8          # discard clips shorter than ~240 ms of speech frame
 WAKE_PHRASE          = "hey sparky"
 WAKE_SILENCE_FRAMES  = 20   # ~0.6 s — shorter wait so wake word triggers snappily
 WAKE_MIN_SPEECH_FRM  = 3    # allow short clips ("hey sparky" is ~0.5 s)
+
+STOP_WINDOW_SEC      = 1.5  # rolling audio window re-checked for the word "stop"
+STOP_CHECK_INTERVAL  = 0.6  # seconds between re-checks while the assistant talks
 
 GREETER_POLL_INTERVAL  = 4    # seconds between camera checks when idle
 GREETER_LISTEN_TIMEOUT = 30   # seconds of silence before checking if person left
@@ -442,6 +466,12 @@ def ensure_voice_model(voice_name: str) -> None:
 
 _voices: dict[str, object] = {}
 _pending_personality: Optional[str] = None   # set by switch_personality tool
+
+# Set once at startup (see main()) so the interrupt listener can use the same
+# input device, VAD, and Whisper model as the rest of the pipeline.
+_in_dev:  Optional[int]            = None
+_vad:     Optional[webrtcvad.Vad]  = None
+_whisper: Optional[WhisperModel]   = None
 
 def get_voice(voice_name: str):
     if voice_name not in _voices:
@@ -596,13 +626,24 @@ def speak(
     out_dev: Optional[int],
     voice_name: str = DEFAULT_VOICE,
     rvc_model: Optional[str] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     text = _clean_for_speech(text)
     if not text:
         return
+    if stop_event is not None and stop_event.is_set():
+        return
     audio, sr = tts_to_array(text, voice_name, rvc_model)
     audio, sr = _resample_for_output(audio, sr)
-    sd.play(audio, samplerate=sr, device=out_dev, blocking=True)
+    if stop_event is None:
+        sd.play(audio, samplerate=sr, device=out_dev, blocking=True)
+        return
+    sd.play(audio, samplerate=sr, device=out_dev)
+    while sd.get_stream().active:
+        if stop_event.is_set():
+            sd.stop()
+            return
+        time.sleep(0.05)
 
 
 def play_beep(out_dev: Optional[int]) -> None:
@@ -623,7 +664,9 @@ def wait_for_wake_word(
     in_dev: Optional[int],
     vad: webrtcvad.Vad,
     model: WhisperModel,
-) -> str:
+    timeout_sec: Optional[float] = None,
+    abort_check: Optional[Callable[[], bool]] = None,
+) -> Optional[str]:
     """
     Block until the wake phrase ('hey sparky') is detected.
     Uses VAD to capture each utterance, then does a fast Whisper transcription
@@ -632,6 +675,11 @@ def wait_for_wake_word(
     Returns any question text that was spoken inline after the wake phrase
     (e.g. "hey sparky, what time is it?" → "what time is it?"), or "" if the
     user paused after the wake phrase and will speak their question separately.
+
+    If timeout_sec is set, returns None after that many seconds of waiting
+    without the wake phrase being heard. If abort_check is set, it is polled
+    (~every 0.5 s) while idle and returns None as soon as it returns True —
+    used by Greeter Mode to react when the camera reports everyone has left.
     """
     q: queue.Queue[bytes] = queue.Queue()
 
@@ -642,6 +690,7 @@ def wait_for_wake_word(
     speech_count  = 0
     silence_count = 0
     in_speech     = False
+    start_time    = time.time()
 
     with sd.RawInputStream(
         samplerate=SAMPLE_RATE,
@@ -653,8 +702,21 @@ def wait_for_wake_word(
     ):
         print(f"\n[Say '{WAKE_PHRASE}' to activate…]", end="", flush=True)
         while True:
-            frame = q.get()
-            if len(frame) != FRAME_SAMPLES * 2:
+            try:
+                frame = q.get(timeout=0.5)
+            except queue.Empty:
+                frame = None
+
+            # Checked every loop iteration (not just on an empty queue) since
+            # the input stream continuously delivers frames, so q.get() rarely
+            # times out — abort_check/timeout would otherwise almost never run.
+            if not in_speech:
+                if abort_check is not None and abort_check():
+                    return None
+                if timeout_sec is not None and (time.time() - start_time) > timeout_sec:
+                    return None
+
+            if frame is None or len(frame) != FRAME_SAMPLES * 2:
                 continue
 
             is_speech = vad.is_speech(frame, SAMPLE_RATE)
@@ -699,6 +761,7 @@ def wait_for_wake_word(
                     speech_count  = 0
                     silence_count = 0
                     in_speech     = False
+                    start_time    = time.time()
 
 
 # ── VAD + recording ───────────────────────────────────────────────────────────
@@ -706,6 +769,7 @@ def record_speech(
     in_dev: Optional[int],
     vad: webrtcvad.Vad,
     timeout_sec: Optional[float] = None,
+    abort_check: Optional[Callable[[], bool]] = None,
 ) -> Optional[np.ndarray]:
     """
     Block until an utterance is detected via VAD, then return it as a
@@ -713,6 +777,10 @@ def record_speech(
 
     If timeout_sec is set, returns None after that many seconds of waiting
     without speech starting — used by Greeter Mode to detect when a person leaves.
+
+    If abort_check is set, it is polled (~every 0.5 s) while no speech is in
+    progress; returning None as soon as it returns True — used by Greeter Mode
+    to react immediately when the camera reports everyone has left.
     """
     q: queue.Queue[bytes] = queue.Queue()
 
@@ -741,18 +809,25 @@ def record_speech(
             try:
                 frame = q.get(timeout=0.5)
             except queue.Empty:
-                now = time.time()
-                if not in_speech:
-                    if timeout_sec is not None and (now - start_time) > timeout_sec:
-                        print(" [timeout]", flush=True)
-                        return None
-                elif in_speech and speech_start_time is not None:
-                    if timeout_sec is not None and (now - speech_start_time) > timeout_sec:
-                        print(" [noise timeout]", flush=True)
-                        return None
-                continue
+                frame = None
 
-            if len(frame) != FRAME_SAMPLES * 2:
+            # Checked every loop iteration (not just on an empty queue) since
+            # the input stream continuously delivers frames, so q.get() rarely
+            # times out — abort_check/timeout would otherwise almost never run.
+            now = time.time()
+            if not in_speech:
+                if abort_check is not None and abort_check():
+                    print(" [abort]", flush=True)
+                    return None
+                if timeout_sec is not None and (now - start_time) > timeout_sec:
+                    print(" [timeout]", flush=True)
+                    return None
+            elif speech_start_time is not None:
+                if timeout_sec is not None and (now - speech_start_time) > timeout_sec:
+                    print(" [noise timeout]", flush=True)
+                    return None
+
+            if frame is None or len(frame) != FRAME_SAMPLES * 2:
                 continue
 
             is_speech = vad.is_speech(frame, SAMPLE_RATE)
@@ -934,6 +1009,13 @@ def _find_camera_index() -> Optional[int]:
     return None
 
 
+# Greeter Mode opens the camera from both the main thread (greetings) and the
+# background scanner thread (people-counting). V4L2 devices can hang on
+# concurrent opens/reads from two threads, so serialize all access here —
+# without this, a collision can permanently freeze the scanner thread.
+_camera_lock = threading.Lock()
+
+
 def _capture_camera_frame(warmup_frames: int = 2) -> Optional[tuple[bytes, str]]:
     """Capture one JPEG frame from the Brio 101.
     Returns (raw_jpeg_bytes, base64_string) or None if the camera is unavailable."""
@@ -941,13 +1023,14 @@ def _capture_camera_frame(warmup_frames: int = 2) -> Optional[tuple[bytes, str]]
     device_idx = _find_camera_index()
     if device_idx is None:
         return None   # Brio not connected
-    cap = cv2.VideoCapture(device_idx)
-    if not cap.isOpened():
-        return None
-    for _ in range(warmup_frames):
-        cap.read()
-    ret, frame = cap.read()
-    cap.release()
+    with _camera_lock:
+        cap = cv2.VideoCapture(device_idx)
+        if not cap.isOpened():
+            return None
+        for _ in range(warmup_frames):
+            cap.read()
+        ret, frame = cap.read()
+        cap.release()
     if not ret or frame is None:
         return None
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -1008,8 +1091,9 @@ def _greet_person(
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 {"type": "text", "text": (
                     "A person has just appeared in front of you. "
-                    "Greet them in character based on what you see. "
-                    "Keep it brief and welcoming."
+                    "Greet them in character based on what you see, very briefly — "
+                    f"one short sentence — and quickly mention they can say "
+                    f"'{WAKE_PHRASE}' to talk to you."
                 )},
             ],
         }
@@ -1018,7 +1102,8 @@ def _greet_person(
             "role": "user",
             "content": (
                 "A person has just appeared in front of you. "
-                "Greet them in character. Keep it brief and welcoming."
+                "Greet them in character, very briefly — one short sentence — "
+                f"and quickly mention they can say '{WAKE_PHRASE}' to talk to you."
             ),
         }
     history.append(user_msg)
@@ -1030,7 +1115,7 @@ def _greet_person(
         timeout=20.0,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    full_raw, _ = _stream_and_speak(stream, out_dev, voice_name, rvc_model)
+    full_raw, _, _ = _stream_and_speak(stream, out_dev, voice_name, rvc_model)
     clean = _strip_think(full_raw)
     # Replace the (possibly image-bearing) user message with a lightweight placeholder
     # so the base64 blob isn't re-sent on every subsequent turn.
@@ -1129,16 +1214,110 @@ def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
+_STOP_RE = re.compile(r"\bstop\b", re.IGNORECASE)
+
+
+def _listen_for_interrupt(
+    stop_audio: threading.Event,
+    user_stopped: threading.Event,
+    speaking_text: list[str],
+) -> None:
+    """
+    Background thread: while the assistant is speaking, listen on the mic for
+    the word "stop". If heard, set both events and immediately halt playback.
+
+    To avoid the assistant interrupting itself (e.g. its own audio bleeding
+    into the mic), any "stop" heard while the currently-spoken sentence
+    (speaking_text[0]) itself contains the word "stop" is ignored.
+
+    Re-checks a rolling window of recent audio on a fixed timer instead of
+    waiting for VAD to report a silence gap after speech: the assistant's own
+    TTS bleeding into the mic can keep the VAD continuously reporting "speech"
+    for the whole sentence, so a silence-triggered segmenter would never close
+    out a segment to transcribe until the assistant fell quiet on its own —
+    by which point the interrupt is moot. Periodic rechecks have no such gap.
+
+    Exits cleanly once stop_audio is set by the caller (normal end of speech).
+    """
+    if _in_dev is None or _vad is None or _whisper is None:
+        return
+
+    q: queue.Queue[bytes] = queue.Queue()
+
+    def cb(indata, frames, t, status):
+        q.put(bytes(indata))
+
+    window_frames: list[bytes] = []
+    window_max_frames = max(1, int(STOP_WINDOW_SEC * 1000 / FRAME_MS))
+    heard_speech_since_check = False
+    last_check = time.time()
+
+    try:
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=FRAME_SAMPLES,
+            dtype="int16",
+            channels=CHANNELS,
+            device=_in_dev,
+            callback=cb,
+        ):
+            while not stop_audio.is_set():
+                try:
+                    frame = q.get(timeout=0.1)
+                except queue.Empty:
+                    frame = None
+
+                if frame is not None and len(frame) == FRAME_SAMPLES * 2:
+                    window_frames.append(frame)
+                    if len(window_frames) > window_max_frames:
+                        del window_frames[: len(window_frames) - window_max_frames]
+                    if _vad.is_speech(frame, SAMPLE_RATE):
+                        heard_speech_since_check = True
+
+                now = time.time()
+                if (heard_speech_since_check
+                        and now - last_check >= STOP_CHECK_INTERVAL
+                        and window_frames):
+                    last_check = now
+                    heard_speech_since_check = False
+                    audio = (
+                        np.frombuffer(b"".join(window_frames), dtype=np.int16)
+                        .astype(np.float32) / 32768.0
+                    )
+                    try:
+                        segs, _ = _whisper.transcribe(
+                            _to_whisper_audio(audio), language="en", beam_size=1,
+                            best_of=1, temperature=0.0,
+                        )
+                        heard = " ".join(s.text for s in segs).lower().strip()
+                    except Exception:
+                        heard = ""
+                    if heard:
+                        print(f"\r[Listening: '{heard}']          ", end="", flush=True)
+                    if heard and _STOP_RE.search(heard) and not _STOP_RE.search(speaking_text[0]):
+                        print(f"\n[Heard '{heard}' → stopping]", flush=True)
+                        user_stopped.set()
+                        stop_audio.set()
+                        sd.stop()
+                        return
+    except Exception as exc:
+        print(f"[interrupt-listener error] {exc}", file=sys.stderr)
+
+
 def _stream_and_speak(
     stream,
     out_dev: Optional[int],
     voice_name: str,
     rvc_model: Optional[str],
-) -> tuple[str, dict[int, dict]]:
+) -> tuple[str, dict[int, dict], bool]:
     """
     Consume one streaming response.  Speaks text sentences as they arrive and
-    accumulates any tool-call fragments.  Returns (full_raw_text, tool_calls).
+    accumulates any tool-call fragments.  Returns (full_raw_text, tool_calls, interrupted).
     tool_calls maps delta index → {id, name, args}.
+    interrupted is True if the user said "stop" while the assistant was speaking.
+
+    A background listener (see _listen_for_interrupt) runs for the duration of
+    this call and can halt playback mid-sentence.
     """
     full_raw: str = ""
     speak_buf: str = ""
@@ -1146,72 +1325,99 @@ def _stream_and_speak(
     tool_calls: dict[int, dict] = {}
     spoke_anything: bool = False
 
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
+    stop_audio    = threading.Event()
+    user_stopped  = threading.Event()
+    speaking_text = [""]   # mutable cell so the listener sees the current sentence
+    listener: Optional[threading.Thread] = None
+    if _in_dev is not None and _vad is not None and _whisper is not None:
+        listener = threading.Thread(
+            target=_listen_for_interrupt,
+            args=(stop_audio, user_stopped, speaking_text),
+            daemon=True,
+        )
+        listener.start()
 
-        # ── Accumulate tool-call fragments ────────────────────────────────────
-        if delta.tool_calls:
-            for tc in delta.tool_calls:
-                idx = tc.index
-                if idx not in tool_calls:
-                    tool_calls[idx] = {"id": "", "name": "", "args": ""}
-                if tc.id:
-                    tool_calls[idx]["id"] += tc.id
-                if tc.function:
-                    if tc.function.name:
-                        tool_calls[idx]["name"] += tc.function.name
-                    if tc.function.arguments:
-                        tool_calls[idx]["args"] += tc.function.arguments
-
-        # ── Stream text content ───────────────────────────────────────────────
-        content = delta.content or ""
-        full_raw += content
-
-        remaining = content
-        while remaining:
-            if in_think:
-                end = remaining.find("</think>")
-                if end == -1:
-                    remaining = ""
-                else:
-                    in_think  = False
-                    remaining = remaining[end + 8:]
-            else:
-                start = remaining.find("<think>")
-                if start == -1:
-                    speak_buf += remaining
-                    remaining  = ""
-                else:
-                    speak_buf += remaining[:start]
-                    in_think   = True
-                    remaining  = remaining[start + 7:]
-
-        while True:
-            best = -1
-            for punct in ".!?":
-                i = speak_buf.find(punct)
-                if i != -1 and (best == -1 or i < best):
-                    best = i
-            if best == -1:
+    try:
+        for chunk in stream:
+            if user_stopped.is_set():
                 break
-            sentence  = speak_buf[: best + 1].strip()
-            speak_buf = speak_buf[best + 1:]
-            if sentence:
-                print(f"  Assistant: {sentence}")
-                speak(sentence, out_dev, voice_name, rvc_model)
-                spoke_anything = True
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
 
-    if speak_buf.strip():
-        print(f"  Assistant: {speak_buf.strip()}")
-        speak(speak_buf.strip(), out_dev, voice_name, rvc_model)
-        spoke_anything = True
+            # ── Accumulate tool-call fragments ────────────────────────────────────
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {"id": "", "name": "", "args": ""}
+                    if tc.id:
+                        tool_calls[idx]["id"] += tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls[idx]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls[idx]["args"] += tc.function.arguments
 
-    if tool_calls and not spoke_anything:
-        speak("Let me look that up.", out_dev, voice_name, rvc_model)
+            # ── Stream text content ───────────────────────────────────────────────
+            content = delta.content or ""
+            full_raw += content
 
-    return full_raw, tool_calls
+            remaining = content
+            while remaining:
+                if in_think:
+                    end = remaining.find("</think>")
+                    if end == -1:
+                        remaining = ""
+                    else:
+                        in_think  = False
+                        remaining = remaining[end + 8:]
+                else:
+                    start = remaining.find("<think>")
+                    if start == -1:
+                        speak_buf += remaining
+                        remaining  = ""
+                    else:
+                        speak_buf += remaining[:start]
+                        in_think   = True
+                        remaining  = remaining[start + 7:]
+
+            while True:
+                best = -1
+                for punct in ".!?":
+                    i = speak_buf.find(punct)
+                    if i != -1 and (best == -1 or i < best):
+                        best = i
+                if best == -1:
+                    break
+                sentence  = speak_buf[: best + 1].strip()
+                speak_buf = speak_buf[best + 1:]
+                if sentence:
+                    speaking_text[0] = sentence.lower()
+                    print(f"  Assistant: {sentence}")
+                    speak(sentence, out_dev, voice_name, rvc_model, stop_event=stop_audio)
+                    spoke_anything = True
+                    if user_stopped.is_set():
+                        break
+
+            if user_stopped.is_set():
+                break
+
+        if not user_stopped.is_set() and speak_buf.strip():
+            sentence = speak_buf.strip()
+            speaking_text[0] = sentence.lower()
+            print(f"  Assistant: {sentence}")
+            speak(sentence, out_dev, voice_name, rvc_model, stop_event=stop_audio)
+            spoke_anything = True
+
+        if tool_calls and not spoke_anything and not user_stopped.is_set():
+            speak("One moment please", out_dev, voice_name, rvc_model, stop_event=stop_audio)
+    finally:
+        stop_audio.set()
+        if listener:
+            listener.join(timeout=1.0)
+
+    return full_raw, tool_calls, user_stopped.is_set()
 
 
 def llm_reply(
@@ -1243,11 +1449,16 @@ def llm_reply(
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
 
-        full_raw, pending = _stream_and_speak(stream, out_dev, voice_name, rvc_model)
+        full_raw, pending, interrupted = _stream_and_speak(stream, out_dev, voice_name, rvc_model)
+        clean = _strip_think(full_raw)
+
+        # ── User said "stop" → halt immediately, drop any pending tool calls ───
+        if interrupted:
+            history.append({"role": "assistant", "content": clean})
+            return clean
 
         # ── No tool calls → done ──────────────────────────────────────────────
         if not pending:
-            clean = _strip_think(full_raw)
             history.append({"role": "assistant", "content": clean})
             return clean
 
@@ -1282,6 +1493,27 @@ def llm_reply(
                 "tool_call_id": tc["id"],
                 "content":      result,
             })
+
+            # ── Personality switch → apply immediately so the very next reply
+            # is generated with the new system prompt and spoken in the new
+            # voice, and instruct the model not to narrate the switch itself.
+            if name == "switch_personality" and _pending_personality:
+                p = PERSONALITIES.get(_pending_personality, {})
+                new_voice = p.get("voice", voice_name)
+                new_rvc   = p.get("rvc")
+                if new_voice != voice_name:
+                    get_voice(new_voice)
+                if new_rvc and new_rvc != rvc_model:
+                    print(f"  Loading RVC ({new_rvc})…", flush=True)
+                    get_rvc(new_rvc)
+                system_prompt = p.get("prompt", system_prompt)
+                voice_name    = new_voice
+                rvc_model     = new_rvc
+                history[-1]["content"] += (
+                    f" You are now {_pending_personality}. Continue the conversation "
+                    "in character, naturally, without mentioning this switch, the "
+                    "tool, or that your personality or voice changed."
+                )
 
 
 # ── Device helpers ────────────────────────────────────────────────────────────
@@ -1387,8 +1619,13 @@ def greeter_main(
     """
     Greeter Mode: watches the camera and proactively greets visitors.
 
-    WATCHING state  — polls camera every GREETER_POLL_INTERVAL seconds.
-    CONVERSING state — greets the person, then listens/responds until they leave.
+    WATCHING state   — polls camera every GREETER_POLL_INTERVAL seconds.
+    CONVERSING state — entered whenever someone is in frame. A brief in-character
+    greeting (mentioning the wake phrase) is given only on the 0 → 1 transition.
+    From there it behaves like wake-word mode: say "hey sparky" before each
+    prompt, or "start conversation mode" to listen freely (and "stop conversation
+    mode" to return to wake-word mode). Returns to WATCHING once the camera
+    confirms everyone has left.
     """
     import threading
 
@@ -1399,145 +1636,156 @@ def greeter_main(
     )
 
     # ── Background camera scanner ─────────────────────────────────────────────
-    # Stores a headcount so the main thread can detect individual arrivals and
-    # departures without ever blocking on a camera call itself.
-    people_count = [0]   # int: number of people currently visible
+    # Stores a headcount and a debounced presence flag so the main thread can
+    # detect individual arrivals/departures without ever blocking on a camera
+    # call itself. The presence flag is debounced *here*, on the scanner's own
+    # fixed cadence, so it's unaffected by how long the main thread happens to
+    # be busy listening/replying — fixing a bug where a long conversation-loop
+    # iteration could swallow the 0-count readings needed to detect a departure,
+    # leaving the session "stuck" and the greeting never re-firing on return.
+    people_count = [0]      # int: latest raw camera headcount
+    present      = [False]  # bool: debounced "someone is here" flag
     stop_event   = threading.Event()
 
     def _scan_loop() -> None:
         # Own client so camera scans never contend with the main conversation
         # thread's HTTP connection pool — the key fix for ARM64/local-vLLM setups.
         scan_client = OpenAI(base_url=LLM_BASE_URL, api_key="none")
+        zero_streak = 0
         while not stop_event.wait(GREETER_POLL_INTERVAL):
             try:
-                people_count[0] = _count_people(scan_client)
-                print(f"\r[Camera: {people_count[0]} person(s) visible]    ",
-                      end="", flush=True)
+                n = _count_people(scan_client)
+                people_count[0] = n
+                print(f"\r[Camera: {n} person(s) visible]    ", end="", flush=True)
+                if n == 0:
+                    zero_streak += 1
+                    if zero_streak >= GREETER_ABSENT_CHECKS:
+                        present[0] = False
+                else:
+                    zero_streak = 0
+                    present[0] = True
             except Exception:
                 pass
 
     scanner = threading.Thread(target=_scan_loop, daemon=True)
     scanner.start()
 
+    was_present       = False
+    history: list[dict] = []
+    responding        = True    # set False by "stop responding" until "continue responding"
+    conversation_mode = False   # set True by "start conversation mode"
+
     try:
         while True:
-            # ── WATCHING: wait until at least one person appears ──────────────
-            if people_count[0] == 0:
+            # ── WATCHING: wait until someone is confirmed present ──────────────
+            if not present[0]:
+                if was_present:
+                    print("[All people left — returning to watch mode]\n", flush=True)
+                was_present = False
                 time.sleep(1.0)
                 continue
 
             # ── CONVERSING ────────────────────────────────────────────────────
-            prev_count = people_count[0]
-            print(f"\n[{prev_count} person(s) detected — starting conversation]",
-                  flush=True)
-            history: list[dict] = []
-            last_spoke   = time.time()
-            absent_count = 0   # consecutive camera scans returning 0 people
-
-            try:
-                _greet_person(client, history, system_prompt, out_dev, voice_name, rvc_model)
-            except Exception as exc:
-                print(f"[Greeting error] {exc}")
-                _say_in_character(client, system_prompt,
-                    "Greet the people in front of you in character (1 sentence).",
-                    out_dev, voice_name, rvc_model)
-            last_spoke = time.time()
-
-            while True:
-                audio = record_speech(in_dev, vad, timeout_sec=GREETER_LISTEN_TIMEOUT)
-                curr = people_count[0]
-
-                # ── Absence check (with hysteresis) ──────────────────────────
-                # Require GREETER_ABSENT_CHECKS consecutive zero-count readings
-                # before ending the conversation — prevents a single false-negative
-                # from the camera (e.g. person briefly out of frame, or the LLM
-                # misidentifying 0 people) from cutting off mid-conversation.
-                if curr == 0:
-                    absent_count += 1
-                    if absent_count >= GREETER_ABSENT_CHECKS:
-                        print("[All people left — returning to watch mode]\n", flush=True)
-                        _say_in_character(client, system_prompt,
-                            "Everyone has just left. Say a farewell in character (1 sentence).",
-                            out_dev, voice_name, rvc_model)
-                        prev_count = 0
-                        break  # back to WATCHING
-                    # Not yet convinced — keep conversing
-                    prev_count = curr
-                    if audio is None:
-                        continue
-                else:
-                    absent_count = 0  # someone is present; reset counter
-
-                # ── Arrivals / partial departures ────────────────────────────
-                if curr != prev_count:
-                    if curr > prev_count:
-                        n    = curr - prev_count
-                        noun = "person has" if n == 1 else f"{n} people have"
-                        print(f"[{n} new person(s) arrived]", flush=True)
-                        try:
-                            llm_reply(client, history,
-                                f"[{noun} just joined. Greet them in character while keeping the ongoing conversation going.]",
-                                out_dev, system_prompt, voice_name, rvc_model)
-                        except Exception as exc:
-                            print(f"[LLM error] {exc}")
-                        last_spoke = time.time()
-                        prev_count = curr
-                        continue
-
-                    else:
-                        n    = prev_count - curr
-                        noun = "person has" if n == 1 else f"{n} people have"
-                        print(f"[{n} person(s) left, {curr} remaining]", flush=True)
-                        _say_in_character(client, system_prompt,
-                            f"{noun} just left the group. Briefly acknowledge their departure in character while remaining available to those still present (1 sentence).",
-                            out_dev, voice_name, rvc_model)
-                        last_spoke = time.time()
-                        prev_count = curr
-
-                # ── Silence / noise timeout ───────────────────────────────────
-                if audio is None:
-                    if time.time() - last_spoke >= 15:
-                        _say_in_character(client, system_prompt,
-                            "The people in front of you have been quiet for a while. In character, gently let them know you are still available (1 sentence).",
-                            out_dev, voice_name, rvc_model)
-                        last_spoke = time.time()
-                    continue
-
-                # ── Transcribe ────────────────────────────────────────────────
-                print("[Transcribing…]", end=" ", flush=True)
-                text = transcribe(audio, whisper)
-                if not text:
-                    continue
-                print(f"You: {text}")
-                last_spoke = time.time()
-
-                # Explicit farewell — wait until frame clears before resetting
-                # so we don't immediately re-greet departing people.
-                if text.lower().strip() in {"quit", "exit", "goodbye", "bye", "stop", "see you"}:
-                    _say_in_character(client, system_prompt,
-                        "The person just said goodbye to you. Say a warm in-character farewell (1 sentence).",
-                        out_dev, voice_name, rvc_model)
-                    # Wait up to 10 s for the frame to clear; don't hang forever
-                    print("[Waiting for people to leave frame…]", flush=True)
-                    deadline = time.time() + 10
-                    while people_count[0] > 0 and time.time() < deadline:
-                        time.sleep(1.0)
-                    prev_count = 0
-                    break
-
-
-                print("[Thinking…]")
+            if not was_present:
+                # Confirmed 0 → nonzero transition: fresh visitor(s), greet them.
+                print(f"\n[{people_count[0]} person(s) detected — entering greeter conversation]",
+                      flush=True)
+                history           = []
+                responding        = True
+                conversation_mode = False
                 try:
-                    llm_reply(client, history, text, out_dev, system_prompt, voice_name, rvc_model)
+                    _greet_person(client, history, system_prompt, out_dev, voice_name, rvc_model)
                 except Exception as exc:
-                    print(f"[LLM error] {exc}")
-                    speak("Sorry, I had trouble with that.", out_dev, voice_name, rvc_model)
-                personality_name, system_prompt, voice_name, rvc_model = _apply_pending_personality(
-                    out_dev, personality_name, system_prompt, voice_name, rvc_model, history)
-                last_spoke = time.time()
-                # prev_count is intentionally NOT updated here — any count change
-                # that occurred while the AI was responding will be caught and
-                # announced at the top of the next loop iteration.
+                    print(f"[Greeting error] {exc}")
+                    _say_in_character(client, system_prompt,
+                        f"Briefly greet the person in character (1 sentence) and mention "
+                        f"they can say '{WAKE_PHRASE}' to talk to you.",
+                        out_dev, voice_name, rvc_model)
+                was_present = True
+
+            # ── Listen for a prompt ───────────────────────────────────────
+            # Conversation mode: listen freely, no wake word required.
+            # Wake-word mode: wait for "hey sparky" before transcribing.
+            if conversation_mode:
+                audio = record_speech(in_dev, vad, timeout_sec=GREETER_LISTEN_TIMEOUT,
+                                       abort_check=lambda: not present[0])
+                text = transcribe(audio, whisper) if audio is not None else ""
+            else:
+                inline = wait_for_wake_word(in_dev, vad, whisper,
+                                              timeout_sec=GREETER_LISTEN_TIMEOUT,
+                                              abort_check=lambda: not present[0])
+                if inline is None:
+                    text = ""   # timed out or everyone left — re-check at top of loop
+                else:
+                    play_beep(out_dev)
+                    if inline:
+                        text = inline
+                    else:
+                        print("[Listening for question…]", end="", flush=True)
+                        audio = record_speech(in_dev, vad, timeout_sec=GREETER_LISTEN_TIMEOUT,
+                                               abort_check=lambda: not present[0])
+                        text = transcribe(audio, whisper) if audio is not None else ""
+
+            # ── Silence / noise timeout ───────────────────────────────────
+            if not text:
+                continue
+
+            print(f"You: {text}")
+
+            # ── Pause / resume responding ────────────────────────────────
+            if _wants_respond_off(text):
+                if responding:
+                    responding = False
+                    print("[Responses paused — say 'continue responding' to resume]\n", flush=True)
+                    speak("Okay, I'll stop responding until you tell me to continue.",
+                          out_dev, voice_name, rvc_model)
+                continue
+
+            if _wants_respond_on(text):
+                if not responding:
+                    responding = True
+                    print("[Responses resumed]\n", flush=True)
+                    speak("I'm listening again.", out_dev, voice_name, rvc_model)
+                continue
+
+            if not responding:
+                continue
+
+            # ── Conversation mode toggle ─────────────────────────────────
+            if _wants_conv_on(text) and not conversation_mode:
+                conversation_mode = True
+                print("[Conversation mode ON — speak freely, say 'stop conversation mode' to return to wake word]\n", flush=True)
+                speak("Conversation mode on. I'm listening.", out_dev, voice_name, rvc_model)
+                continue
+
+            if _wants_conv_off(text) and conversation_mode:
+                conversation_mode = False
+                print(f"[Wake word mode — say '{WAKE_PHRASE}' to activate]\n", flush=True)
+                speak("Returning to wake word mode. Say hey Sparky to wake me up.", out_dev, voice_name, rvc_model)
+                continue
+
+            # Explicit farewell
+            if text.lower().strip() in {"quit", "exit", "goodbye", "bye", "stop", "see you"}:
+                _say_in_character(client, system_prompt,
+                    "The person just said goodbye to you. Say a warm in-character farewell (1 sentence).",
+                    out_dev, voice_name, rvc_model)
+                # Wait briefly for the person to leave the frame so we don't
+                # immediately re-greet them on the next loop iteration.
+                print("[Waiting for people to leave frame…]", flush=True)
+                deadline = time.time() + 10
+                while present[0] and time.time() < deadline:
+                    time.sleep(1.0)
+                was_present = present[0]
+                continue
+
+            print("[Thinking…]")
+            try:
+                llm_reply(client, history, text, out_dev, system_prompt, voice_name, rvc_model)
+            except Exception as exc:
+                print(f"[LLM error] {exc}")
+                speak("Sorry, I had trouble with that.", out_dev, voice_name, rvc_model)
+            personality_name, system_prompt, voice_name, rvc_model = _apply_pending_personality(
+                out_dev, personality_name, system_prompt, voice_name, rvc_model, history)
 
     except KeyboardInterrupt:
         print("\n[Greeter Mode stopped]")
@@ -1573,7 +1821,7 @@ def main() -> None:
     print(f"Mic    → {in_name}")
     print(f"Output → {out_name}")
     if camera_present:
-        print("Camera → Brio 101 (video enabled)")
+        print("Camera → detected (enabled)")
     else:
         print("Camera → not detected (camera features disabled)")
 
@@ -1610,6 +1858,10 @@ def main() -> None:
 
     vad    = webrtcvad.Vad(VAD_MODE)
     client = OpenAI(base_url=LLM_BASE_URL, api_key="none")
+
+    # Make these available to the background "stop" interrupt listener.
+    global _in_dev, _vad, _whisper
+    _in_dev, _vad, _whisper = in_dev, vad, whisper
 
     if mode == "greeter":
         greeter_main(client, whisper, vad, in_dev, out_dev,
