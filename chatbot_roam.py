@@ -96,6 +96,13 @@ ROAM_MAX_ANGULAR_RPS = 1.0   # hard cap on roam-mode rotation speed (~67.5 deg/s
 ROAM_MAX_CMD_SEC     = 2.0     # hard cap on the duration of any single drive_robot call
 ROAM_CMD_REFRESH_SEC = 0.1     # how often drive_robot republishes the heartbeat seq
 ROAM_NAV_LLM_TIMEOUT = 15.0    # seconds before a hung navigation LLM call is abandoned and retried fresh
+# Front-facing LaserCAN distance sensor, published by the robot code over NT.
+# Its value is in millimetres (a robot parked ~2.9 m from a wall reads ~2870).
+ROAM_LASER_TOPIC     = "/SmartDashboard/LaserCAN Distance"
+ROAM_LASER_TO_M      = 0.001   # sensor units -> metres
+ROAM_LASER_STOP_M    = 0.5     # forward moves are refused / cut short when something is this close ahead
+# WPILib's standard driver-station state bitmask, published by every robot.
+ROAM_DS_CONTROL_TOPIC = "/FMSInfo/FMSControlData"
 ROAM_NAV_HISTORY_LEN = 15      # recent navigation steps shown back to the explore LLM
 ROAM_NAV_CELL_M      = 1.0     # grid cell size (m) for tracking which areas were visited
 TOOLS = [
@@ -230,7 +237,10 @@ DRIVE_ROBOT_TOOL = {
             "seconds — issue another call to keep moving. rotate_left/rotate_right "
             "turn a fixed number of degrees (see the degrees parameter) instead "
             "of running for a chosen speed and duration. "
-            "Use direction stop to not move."
+            "Use direction stop to not move. "
+            "A laser on the front measures the distance straight ahead: forward "
+            f"is refused when something is closer than {ROAM_LASER_STOP_M} m, and "
+            "a forward move stops early if something comes that close."
         ),
         "parameters": {
             "type": "object",
@@ -264,8 +274,24 @@ _NAV_DRIVE_ROBOT_TOOL["function"]["description"] += (
 )
 # Used for the focused per-step navigation decision while exploring.
 ROAM_NAV_TOOLS = [_NAV_DRIVE_ROBOT_TOOL]
+# Lets the chat LLM answer questions about the front laser (the navigator gets
+# the reading automatically each step instead). Roam Mode only, like
+# drive_robot: the sensor lives on the robot.
+READ_DISTANCE_SENSOR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_distance_sensor",
+        "description": (
+            "Read the laser distance sensor on the front of the robot: the "
+            "distance to the nearest thing straight ahead, along a narrow beam. "
+            "Use when someone asks how far away something in front of you is, "
+            "how close they are, or about your distance sensor."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
 # Used during a conversation so a person can ask Sparky to move while chatting.
-ROAM_CHAT_TOOLS = TOOLS + [DRIVE_ROBOT_TOOL]
+ROAM_CHAT_TOOLS = TOOLS + [DRIVE_ROBOT_TOOL, READ_DISTANCE_SENSOR_TOOL]
 
 # Dedicated, minimal system prompt for the background exploration thread
 # (see _roam_navigate_step) — deliberately kept separate from the chatbot's
@@ -290,7 +316,14 @@ _EXPLORE_SYSTEM_PROMPT = (
     "to head toward places you haven't been yet, and avoid repeating the same "
     "moves or going back over areas you've already explored. The position is "
     "a rough dead-reckoning estimate that drifts over time, so always trust the "
-    "cameras over it when it comes to obstacles."
+    "cameras over it when it comes to obstacles. "
+    "You also get a front laser reading: the exact distance to whatever is "
+    "straight ahead, along a narrow beam. Trust it for what's directly in "
+    "front of you, but it can miss things off to the sides, low down, or thin "
+    f"— check the cameras for those. Forward is refused under {ROAM_LASER_STOP_M} m "
+    "and a forward move stops early if anything gets that close, so when the "
+    "laser shows less than about 1.5 m ahead, a full one-meter move won't fit: "
+    "prefer turning toward open space."
 )
 
 # ── Personalities ─────────────────────────────────────────────────────────────
@@ -305,6 +338,7 @@ _BASE_PROMPT = (
     "You are mounted on a moving swerve drive base. Exploring the surroundings and finding people is handled entirely by a separate, independent part of the system — not by you — so you never need to think about exploring, patrolling, or looking for people. "
     "You are brought into a conversation either when someone says 'hey sparky', or when that separate part of the system has stopped near a person and already greeted them for you. Don't greet people again or start talking to anyone unprompted; just respond to what they say. "
     "During a conversation you may use the drive_robot tool, but only if the person you're talking to explicitly asks you to move, turn, follow them, or reposition — never use it on your own initiative. "
+    "When you're on the robot you also have a laser distance sensor on your front: use the read_distance_sensor tool, if it's available, whenever someone asks how far away something ahead of you is or about the sensor. "
     "Always prioritize using a tool when it would be helpful, even if the user does not ask specifically for the tool. "
     "You have no internet access. For questions about recent events or anything after your training data, use search_wikipedia if it might help, and otherwise say you don't have up-to-date information rather than guessing. "
     # Filled in when the program starts, rather than hard-coded, so it
@@ -1143,6 +1177,10 @@ def _init_networktables() -> dict:
     _nt_state["omega"] = table.getDoubleTopic("cmd_omega").publish()
     _nt_state["seq"]   = table.getIntegerTopic("cmd_seq").publish()
     _nt_state["seq_n"] = 0
+    # NaN default = "never received a reading" (see _front_distance_m).
+    _nt_state["laser"] = inst.getDoubleTopic(ROAM_LASER_TOPIC).subscribe(float("nan"))
+    # -1 default = "never received" (see _robot_drive_block).
+    _nt_state["ds"]    = inst.getIntegerTopic(ROAM_DS_CONTROL_TOPIC).subscribe(-1)
     return _nt_state
 
 
@@ -1153,6 +1191,62 @@ def _robot_connected() -> bool:
         return _init_networktables()["inst"].isConnected()
     except Exception:
         return False
+
+
+# FMSControlData bits (WPILib HAL ControlWord).
+_DS_ENABLED, _DS_AUTO, _DS_TEST, _DS_ESTOP = 0x01, 0x02, 0x04, 0x08
+
+
+def _robot_drive_block() -> Optional[str]:
+    """Return why the robot won't act on drive commands right now, or None
+    if it will. The robot-side RoamDriveInterface only drives while enabled
+    in autonomous (not test), so commands sent at any other time are silently
+    ignored — this lets callers skip them instead of reporting a move (and
+    updating the navigation pose) that never happened."""
+    try:
+        nt = _init_networktables()
+    except Exception as e:
+        return f"NetworkTables error: {e}"
+    if not nt["inst"].isConnected():
+        return f"not connected to the robot ({ROBOT_NT_HOST})"
+    word = nt["ds"].get()
+    if word < 0:
+        return "no driver station state from the robot yet"
+    if word & _DS_ESTOP:
+        return "the robot is emergency-stopped"
+    if not word & _DS_ENABLED:
+        return "the robot is disabled"
+    if not word & _DS_AUTO or word & _DS_TEST:
+        return "the robot is enabled but not in autonomous mode, which roam driving requires"
+    return None
+
+
+def _front_distance_m() -> Optional[float]:
+    """Distance in metres to whatever is straight ahead, from the robot's
+    front LaserCAN, or None if there's no usable reading (not connected to
+    the robot, never published, or a non-positive value). Callers treat
+    None as "can't see ahead" — forward moves fail safe rather than drive
+    blind."""
+    try:
+        nt = _init_networktables()
+    except Exception:
+        return None
+    if not nt["inst"].isConnected():
+        return None
+    v = nt["laser"].get()
+    if v != v or v <= 0:   # NaN (never published) or invalid
+        return None
+    return v * ROAM_LASER_TO_M
+
+
+def _tool_read_distance_sensor() -> str:
+    d = _front_distance_m()
+    if d is None:
+        if not _robot_connected():
+            return f"Can't read the distance sensor: not connected to the robot ({ROBOT_NT_HOST})."
+        return "The front distance sensor isn't giving a reading right now."
+    return (f"The front laser reads {d:.2f} meters ({d * 100:.0f} cm, "
+            f"{d * 3.28084:.1f} feet) to the nearest thing straight ahead.")
 
 
 # direction -> unit (vx, vy, omega) in the robot-relative frame, before scaling
@@ -1327,6 +1421,12 @@ def _tool_drive_robot(
         _publish(0.0, 0.0, 0.0)
         return "Stopped."
 
+    # The robot ignores drive commands unless it's enabled in autonomous —
+    # say so rather than reporting (and recording) a move that won't happen.
+    block = _robot_drive_block()
+    if block:
+        return f"Didn't move: {block}."
+
     ux, uy, uw = unit
     if uw != 0.0:
         deg          = degrees if degrees in _TURN_DEGREE_CHOICES else 90
@@ -1340,18 +1440,46 @@ def _tool_drive_robot(
         duration_sec = ROAM_MAX_CMD_SEC
         summary      = f"Moved {direction} at full speed for {duration_sec:.1f}s."
 
+    # Front laser hard stop: enforced here, in code, whatever the LLM decided
+    # (navigator or chat). It only sees straight ahead, so it only gates
+    # moves with a forward component. No reading counts as blocked — never
+    # drive forward blind.
+    checks_front = vx > 0.0
+    if checks_front:
+        d = _front_distance_m()
+        if d is None:
+            return "Didn't move forward: the front laser isn't giving a reading, so I can't tell what's ahead."
+        if d < ROAM_LASER_STOP_M:
+            return (f"Didn't move forward: something is {d:.2f} m straight ahead "
+                    f"(the limit is {ROAM_LASER_STOP_M:.2f} m). Turn away first.")
+
     elapsed = 0.0
     aborted = False
+    laser_stop: Optional[str] = None
     while elapsed < duration_sec:
         if should_abort is not None and should_abort():
             aborted = True
             break
+        block = _robot_drive_block()
+        if block:
+            break
+        if checks_front:
+            d = _front_distance_m()
+            if d is None or d < ROAM_LASER_STOP_M:
+                laser_stop = ("lost the front laser reading" if d is None
+                              else f"something came within {d:.2f} m ahead")
+                break
         _publish(vx, vy, omega)
         time.sleep(ROAM_CMD_REFRESH_SEC)
         elapsed += ROAM_CMD_REFRESH_SEC
 
     _publish(0.0, 0.0, 0.0)   # don't keep moving once this call returns
     _nav_record_motion(vx * elapsed, vy * elapsed, omega * elapsed)
+    if block:
+        return f"Stopped after {elapsed:.1f}s of '{direction}': {block}."
+    if laser_stop:
+        return (f"Stopped early after {elapsed:.1f}s (about {abs(vx) * elapsed:.1f} m): "
+                f"{laser_stop}.")
     if aborted:
         return f"Interrupted after {elapsed:.1f}s of '{direction}' — stopped."
     return summary
@@ -1886,6 +2014,8 @@ def _execute_tool(name: str, args: dict) -> str:
         return _tool_switch_personality(args.get("name", ""))
     if name == "drive_robot":
         return _tool_drive_robot(args.get("direction", "stop"), args.get("degrees"))
+    if name == "read_distance_sensor":
+        return _tool_read_distance_sensor()
     return f"Unknown tool: {name}"
 
 
@@ -2416,7 +2546,7 @@ def roam_main(
         nav_client = OpenAI(base_url=LLM_BASE_URL, api_key="none", max_retries=0)
         last_presence = 0.0
         seen: Optional[bool] = None
-        robot_up: Optional[bool] = None
+        robot_block: Optional[str] = None   # last reported reason the robot can't drive; "" = it can
         while not stop_event.wait(0.1):
             if conversation_mode:
                 # Not navigating — use the cameras to check the person is
@@ -2435,18 +2565,20 @@ def roam_main(
             seen = None
             if conversing.is_set():
                 continue
-            # No point asking the LLM for moves the robot can't receive.
-            if not _robot_connected():
-                if robot_up is not False:
-                    print(f"[Explore: waiting for robot connection ({ROBOT_NT_HOST})…]", flush=True)
-                    _debug_set_status(robot="disconnected")
-                robot_up = False
+            # No point asking the LLM for moves the robot won't carry out —
+            # not connected, disabled, e-stopped, or not in autonomous.
+            block = _robot_drive_block()
+            if block:
+                if block != robot_block:
+                    print(f"[Explore: paused — {block}]", flush=True)
+                    _debug_set_status(robot=block)
+                robot_block = block
                 stop_event.wait(1.0)
                 continue
-            if robot_up is not True:
-                print("[Explore: robot connected]", flush=True)
-                _debug_set_status(robot="connected")
-            robot_up = True
+            if robot_block != "":
+                print("[Explore: robot enabled in autonomous — exploring]", flush=True)
+                _debug_set_status(robot="enabled (autonomous)")
+            robot_block = ""
             # Back-to-back: _roam_navigate_step only returns once its drive
             # command has finished, so the next photo is always taken after
             # the previous move is done — no fixed scan interval.
@@ -2694,6 +2826,10 @@ def _roam_navigate_step(client: OpenAI, paused: Callable[[], bool]) -> bool:
     ]
     labels = ", ".join(_camera_label(idx) for idx, _, _ in frames)
     memory = _nav_memory_text()
+    ahead = _front_distance_m()
+    laser = (f"Front laser: {ahead:.2f} m to the nearest thing straight ahead."
+             if ahead is not None else
+             "Front laser: no reading right now — forward moves will be refused until it reports.")
     with _nav_lock:
         pose_before = dict(_nav_pose)
     try:
@@ -2704,7 +2840,7 @@ def _roam_navigate_step(client: OpenAI, paused: Callable[[], bool]) -> bool:
                 {"role": "user", "content": [
                     *image_content,
                     {"type": "text", "text": (
-                        f"{memory}\n\n"
+                        f"{memory}\n\n{laser}\n\n"
                         f"These are your current camera views, in this order: {labels}. "
                         "Make ONE drive_robot call."
                     )},

@@ -11,7 +11,7 @@
 #
 # ssh asks for the Spark's password on each connection — twice per deploy. To
 # skip that, install an SSH key once:
-#   ssh-copy-id rshoff@10.41.43.203
+#   ssh-copy-id rshoff@10.41.43.55
 # The password is deliberately not stored here: this folder is a git repo.
 #
 # The roam script runs in the foreground over ssh: its output shows here, and
@@ -19,7 +19,7 @@
 # killed too and the robot-side watchdog stops the drive base.
 set -euo pipefail
 
-SPARK="${SPARK:-rshoff@10.41.43.203}"
+SPARK="${SPARK:-rshoff@10.41.43.55}"
 SPARK_DIR="${SPARK_DIR:-workspace/sparky}"
 FILES=(chatbot_roam.py chatbot.py run.sh setup.sh setup2.sh requirements.txt README.md CLAUDE.md)
 SSH_OPTS=(-o ConnectTimeout=10)
